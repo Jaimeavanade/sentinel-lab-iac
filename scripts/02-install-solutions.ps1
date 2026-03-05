@@ -15,7 +15,7 @@ function Clean([string]$s) {
 
 # ---- Inputs ----
 $SolutionsCsv = Clean $SolutionsCsv
-$solutions = $SolutionsCsv.Split(",") | ForEach-Object { Clean $_ } | Where-Object { $_ }
+$solutions = $SolutionsCsv.Split(",") | ForEach-Object { Clean $_ }
 
 Write-Host "Instalación de soluciones solicitadas: $($solutions -join ' | ')"
 
