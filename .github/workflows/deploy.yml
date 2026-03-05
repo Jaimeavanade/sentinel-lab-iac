@@ -42,7 +42,7 @@ jobs:
                           workspaceName="${{ vars.WORKSPACE_NAME }}" \
                           retentionInDays=${{ vars.RETENTION_DAYS }}
 
-      - name: Enable Sentinel + Install Solutions
+      - name: Onboard Sentinel
         uses: azure/powershell@v1
         with:
           azPSVersion: "latest"
@@ -51,8 +51,22 @@ jobs:
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
-            # OJO: aquí tiene que ser & (no &amp;)
-            & "${{ github.workspace }}/scripts/enable-sentinel-and-install-solutions.ps1" `
+            & "${{ github.workspace }}/scripts/01-onboard-sentinel.ps1" `
+              -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
+              -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
+              -MaxWaitSeconds 180
+
+      - name: Install Sentinel Solutions
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          errorActionPreference: "Stop"
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
+
+            & "${{ github.workspace }}/scripts/02-install-solutions.ps1" `
               -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
               -SolutionsCsv "${{ vars.SENTINEL_SOLUTIONS }}"
+
