@@ -38,6 +38,23 @@ Write-Host "OK: Sentinel onboarded (or already onboarded)."
 # Catalog: contentProductPackages list [3](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
 # Install: contentPackages install [4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/install?view=rest-securityinsights-2025-09-01)
 $catalogApiVersion = "2025-09-01"
+
+# Escapar comillas simples para OData
+$solEscaped = $sol.Replace("'", "''")
+$filter = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/displayName eq '$solEscaped'")
+
+$catalogUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$catalogApiVersion&`$filter=$filter&`$top=5"
+
+$resp = Invoke-AzRestMethod -Method GET -Uri $catalogUri
+$json = ($resp.Content | ConvertFrom-Json)
+
+if (-not $json.value -or $json.value.Count -eq 0) {
+  Write-Warning "No encontrado en catálogo por displayName exacto: $sol"
+  continue
+}
+
+$pkg = $json.value | Select-Object -First 1
+``
 $installApiVersion = "2025-09-01"
 
 foreach ($sol in $solutions) {
