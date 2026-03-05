@@ -40,8 +40,7 @@ jobs:
               --template-file "infra/main.bicep" \
               --parameters location="${{ vars.LOCATION }}" \
                           workspaceName="${{ vars.WORKSPACE_NAME }}" \
-                          retentionInDays=${{ vars.RETENTION_DAYS }} \
-                          dailyQuotaGb=${{ vars.DAILY_CAP_GB }}
+                          retentionInDays=${{ vars.RETENTION_DAYS }}
 
       - name: Enable Sentinel + Install Solutions
         uses: azure/powershell@v1
