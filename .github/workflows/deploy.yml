@@ -1,0 +1,54 @@
+name: Deploy Log Analytics + Sentinel + Solutions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+
+      - name: Create Resource Group
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az group create \
+              --name "${{ vars.RESOURCE_GROUP }}" \
+              --location "${{ vars.LOCATION }}"
+
+      - name: Deploy Log Analytics Workspace (Bicep)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az deployment group create \
+              --resource-group "${{ vars.RESOURCE_GROUP }}" \
+              --template-file "infra/main.bicep" \
+              --parameters location="${{ vars.LOCATION }}" \
+                          workspaceName="${{ vars.WORKSPACE_NAME }}" \
+                          retentionInDays=${{ vars.RETENTION_DAYS }}
+
+      - name: Enable Sentinel + Install Solutions
+        uses: azure/powershell@v1
+        with:
+          azPSVersion: "latest"
+          errorActionPreference: "Stop"
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            & "${{ github.workspace }}/scripts/enable-sentinel-and-install-solutions.ps1" `
+              -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
+              -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
+              -SolutionsCsv "${{ vars.SENTINEL_SOLUTIONS }}"
