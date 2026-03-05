@@ -21,7 +21,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           audience: api://AzureADTokenExchange
-          enable-AzPSSession: true
+          enable-AzPSSession: true  # clave para Az PowerShell [5](https://docs.azure.cn/en-us/sentinel/sentinel-solutions-catalog)[6](https://learn.microsoft.com/es-es/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
 
       - name: Create Resource Group
         uses: azure/cli@v2
@@ -40,7 +40,8 @@ jobs:
               --template-file "infra/main.bicep" \
               --parameters location="${{ vars.LOCATION }}" \
                           workspaceName="${{ vars.WORKSPACE_NAME }}" \
-                          retentionInDays=${{ vars.RETENTION_DAYS }}
+                          retentionInDays=${{ vars.RETENTION_DAYS }} \
+                          dailyQuotaGb=${{ vars.DAILY_CAP_GB }}
 
       - name: Enable Sentinel + Install Solutions
         uses: azure/powershell@v1
@@ -49,6 +50,9 @@ jobs:
           errorActionPreference: "Stop"
           inlineScript: |
             $ErrorActionPreference = "Stop"
+            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
+
+            # OJO: aquí tiene que ser & (no &amp;)
             & "${{ github.workspace }}/scripts/enable-sentinel-and-install-solutions.ps1" `
               -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
