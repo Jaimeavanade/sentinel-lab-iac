@@ -56,10 +56,27 @@ foreach ($sol in $solutions) {
   }
 
   # Elegimos el primero que parezca Solution
-  $pkg = $json.value | Where-Object { $_.properties -and $_.properties.contentKind -eq "Solution" } | Select-Object -First 1
-  if (-not $pkg) { 
-    $pkg = $json.value | Select-Object -First 1
-  }
+  # Preferimos coincidencia exacta de displayName (case-insensitive)
+$pkg = $json.value |
+  Where-Object { $_.properties -and $_.properties.contentKind -eq "Solution" } |
+  Where-Object { $_.properties.displayName -and ($_.properties.displayName.Trim().ToLower() -eq $sol.Trim().ToLower()) } |
+  Select-Object -First 1
+
+# Si no hay exacta, intentamos "contains" (para casos tipo "Azure Activity" vs "Azure Activity (Preview)")
+if (-not $pkg) {
+  $pkg = $json.value |
+    Where-Object { $_.properties -and $_.properties.contentKind -eq "Solution" } |
+    Where-Object { $_.properties.displayName -and ($_.properties.displayName.Trim().ToLower().Contains($sol.Trim().ToLower())) } |
+    Select-Object -First 1
+}
+
+# Si sigue sin haber, log y continua
+if (-not $pkg) {
+  Write-Warning "No encontré coincidencia razonable en el catálogo para: $sol"
+  Write-Host "Top resultados devueltos:"
+  $json.value | Select-Object -First 5 | ForEach-Object { Write-Host (" - " + $_.properties.displayName + " | id=" + $_.name) }
+  continue
+}
 
   $packageId = $pkg.name
   $contentId = $pkg.properties.contentId
@@ -75,7 +92,7 @@ foreach ($sol in $solutions) {
 
   Write-Host "Instalando: $displayName | packageId=$packageId | version=$version"
 
-  $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/$packageId?api-version=$installApiVersion"
+  $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$installApiVersion"
 
   $installBody = @{
     properties = @{
