@@ -9,18 +9,17 @@ Set-StrictMode -Version Latest
 
 # Normaliza entradas (quita comillas raras)
 $SolutionsCsv = $SolutionsCsv.Trim().Replace("“","").Replace("”","").Replace('"','')
-$solutions = $SolutionsCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+$solutionList = $SolutionsCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 Write-Host "RG=$ResourceGroup"
 Write-Host "Workspace=$WorkspaceName"
-Write-Host "Solutions=$($solutions -join ' | ')"
+Write-Host "Solutions=$($solutionList -join ' | ')"
 
 $ctx = Get-AzContext
-if (-not $ctx) { throw "No hay contexto Az. ¿Falló azure/login?" }
+if (-not $ctx) { throw "No hay contexto Az. Revisa azure/login con enable-AzPSSession=true." }
 $subId = $ctx.Subscription.Id
 
-# 1) Onboard Microsoft Sentinel (onboardingStates/default)
-# API oficial: Sentinel Onboarding States (Create) [2](https://learn.microsoft.com/en-us/rest/api/securityinsights/sentinel-onboarding-states/create?view=rest-securityinsights-2025-09-01)[10](https://learn.microsoft.com/en-us/rest/api/securityinsights/sentinel-onboarding-states?view=rest-securityinsights-2025-09-01)
+# 1) Onboard Microsoft Sentinel (onboardingStates/default) [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages/list?view=rest-securityinsights-2025-09-01)[2](https://microsoft.github.io/TechExcel-Sentinel-onboarding-and-migration-acceleration/docs/Ex02/0201.html)
 $onboardingApiVersion = "2025-09-01"
 $onboardingUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/onboardingStates/default?api-version=$onboardingApiVersion"
 
@@ -34,90 +33,58 @@ Write-Host "Onboarding Sentinel..."
 Invoke-AzRestMethod -Method PUT -Uri $onboardingUri -Payload $payload | Out-Null
 Write-Host "OK: Sentinel onboarded (or already onboarded)."
 
-# 2) Buscar paquetes (Content Hub catalog) y luego instalarlos
-# Catalog: contentProductPackages list [3](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
-# Install: contentPackages install [4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/install?view=rest-securityinsights-2025-09-01)
+# Verificación rápida (GET)
+$check = Invoke-AzRestMethod -Method GET -Uri $onboardingUri
+Write-Host "OnboardingState GET => $($check.StatusCode)"
+
+# 2) Catálogo de soluciones (contentProductPackages) y luego instalar (contentPackages) [3](https://github.com/microsoft/sentinel-as-code/milestones)[4](https://sentinel.blog/automating-microsoft-sentinel-deployment-with-github-actions/)
 $catalogApiVersion = "2025-09-01"
-
-# Escapar comillas simples para OData
-$solEscaped = $sol.Replace("'", "''")
-$filter = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/displayName eq '$solEscaped'")
-
-$catalogUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$catalogApiVersion&`$filter=$filter&`$top=5"
-
-$resp = Invoke-AzRestMethod -Method GET -Uri $catalogUri
-$json = ($resp.Content | ConvertFrom-Json)
-
-if (-not $json.value -or $json.value.Count -eq 0) {
-  Write-Warning "No encontrado en catálogo por displayName exacto: $sol"
-  continue
-}
-
-$pkg = $json.value | Select-Object -First 1
-``
 $installApiVersion = "2025-09-01"
 
-foreach ($sol in $solutions) {
+foreach ($solutionName in $solutionList) {
   Write-Host ""
-  Write-Host "==> Buscar paquete para: $sol"
+  Write-Host "==> Buscar paquete para: $solutionName"
 
-  $search = [System.Uri]::EscapeDataString($sol)
-  $catalogUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$catalogApiVersion&`$search=$search&`$top=5"
+  # Filtro exacto por displayName para evitar resultados random (1Password, etc.) [3](https://github.com/microsoft/sentinel-as-code/milestones)
+  $nameEscapedForOdata = $solutionName.Replace("'", "''")
+  $filterRaw = "properties/contentKind eq 'Solution' and properties/displayName eq '$nameEscapedForOdata'"
+  $filterEncoded = [System.Uri]::EscapeDataString($filterRaw)
 
+  $catalogUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$catalogApiVersion&`$filter=$filterEncoded&`$top=5"
   $resp = Invoke-AzRestMethod -Method GET -Uri $catalogUri
-  $json = ($resp.Content | ConvertFrom-Json)
+  $json = $resp.Content | ConvertFrom-Json
 
   if (-not $json.value -or $json.value.Count -eq 0) {
-    Write-Warning "No encontrado en catálogo: $sol"
+    Write-Warning "No encontrado en catálogo (displayName exacto): $solutionName"
     continue
   }
 
-  # Elegimos el primero que parezca Solution
-  # Preferimos coincidencia exacta de displayName (case-insensitive)
-$pkg = $json.value |
-  Where-Object { $_.properties -and $_.properties.contentKind -eq "Solution" } |
-  Where-Object { $_.properties.displayName -and ($_.properties.displayName.Trim().ToLower() -eq $sol.Trim().ToLower()) } |
-  Select-Object -First 1
+  $pkg = $json.value | Select-Object -First 1
 
-# Si no hay exacta, intentamos "contains" (para casos tipo "Azure Activity" vs "Azure Activity (Preview)")
-if (-not $pkg) {
-  $pkg = $json.value |
-    Where-Object { $_.properties -and $_.properties.contentKind -eq "Solution" } |
-    Where-Object { $_.properties.displayName -and ($_.properties.displayName.Trim().ToLower().Contains($sol.Trim().ToLower())) } |
-    Select-Object -First 1
-}
-
-# Si sigue sin haber, log y continua
-if (-not $pkg) {
-  Write-Warning "No encontré coincidencia razonable en el catálogo para: $sol"
-  Write-Host "Top resultados devueltos:"
-  $json.value | Select-Object -First 5 | ForEach-Object { Write-Host (" - " + $_.properties.displayName + " | id=" + $_.name) }
-  continue
-}
-
-  $packageId = $pkg.name
-  $contentId = $pkg.properties.contentId
-  $contentKind = $pkg.properties.contentKind
-  $contentProductId = $pkg.properties.contentProductId
-  $displayName = $pkg.properties.displayName
-  $version = $pkg.properties.version
+  $packageId       = $pkg.name
+  $contentId       = $pkg.properties.contentId
+  $contentKind     = $pkg.properties.contentKind
+  $contentProductId= $pkg.properties.contentProductId
+  $displayName     = $pkg.properties.displayName
+  $version         = $pkg.properties.version
 
   if (-not $packageId -or -not $contentId -or -not $contentProductId -or -not $version) {
-    Write-Warning "Paquete incompleto para '$sol'. Saltando."
+    Write-Warning "Paquete incompleto para '$solutionName'. Saltando."
     continue
   }
 
   Write-Host "Instalando: $displayName | packageId=$packageId | version=$version"
 
+  # IMPORTANTE: usar ${packageId} para que PowerShell no interprete $packageId?api [4](https://sentinel.blog/automating-microsoft-sentinel-deployment-with-github-actions/)
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$installApiVersion"
 
   $installBody = @{
     properties = @{
-      contentId = $contentId
-      contentKind = $contentKind
+      contentId        = $contentId
+      contentKind      = $contentKind
       contentProductId = $contentProductId
-      displayName = $displayName
-      version = $version
+      displayName      = $displayName
+      version          = $version
     }
   } | ConvertTo-Json -Depth 10
 
