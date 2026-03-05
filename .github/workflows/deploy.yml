@@ -49,8 +49,6 @@ jobs:
           errorActionPreference: "Stop"
           inlineScript: |
             $ErrorActionPreference = "Stop"
-            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
-
             & "${{ github.workspace }}/scripts/enable-sentinel-and-install-solutions.ps1" `
               -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
