@@ -18,6 +18,14 @@ function Normalize-Input {
   return $t
 }
 
+function Has-Prop {
+  param(
+    [Parameter(Mandatory=$true)]$Obj,
+    [Parameter(Mandatory=$true)][string]$Name
+  )
+  return ($null -ne $Obj) -and ($Obj.PSObject.Properties.Name -contains $Name)
+}
+
 function Get-AllPages {
   param(
     [Parameter(Mandatory=$true)][string]$FirstUri,
@@ -51,19 +59,23 @@ function Get-AllPages {
 
     $json = $resp.Content | ConvertFrom-Json
 
-    if ($json.error) {
-      Write-Host "  Response (raw): $($resp.Content)"
-      throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
+    # ✅ StrictMode-safe: solo mirar .error si existe la propiedad
+    if (Has-Prop -Obj $json -Name 'error') {
+      if ($json.error) {
+        Write-Host "  Response (raw): $($resp.Content)"
+        throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
+      }
     }
 
-    if (-not ($json.PSObject.Properties.Name -contains 'value')) {
+    if (-not (Has-Prop -Obj $json -Name 'value')) {
       Write-Host "  Response (raw): $($resp.Content)"
       throw "La respuesta no tiene propiedad 'value'."
     }
 
     if ($json.value) { $items += $json.value }
 
-    if ($json.nextLink) {
+    # nextLink (si viene) para paginación [2](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_onboardingstates.html)
+    if (Has-Prop -Obj $json -Name 'nextLink' -and $json.nextLink) {
       $uri = $json.nextLink
       $page++
     } else {
@@ -104,13 +116,12 @@ $knownContentIds = @{
 # 3) Catálogo
 $catalogPackagesBase  = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
-# IMPORTANTE: aquí NO añadimos nada de OData ($top, $filter...) porque te da 400
+# IMPORTANTE: para contentProductTemplates NO usamos OData ($top/$filter) porque te devolvía 400.
 $catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
   param([Parameter(Mandatory=$true)][string]$ContentId)
 
-  # Este endpoint sí te ha funcionado con $filter, lo dejamos como estaba
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterEncoded = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'")
   $uri = "$catalogPackagesBase&`$filter=$filterEncoded&`$top=5"
@@ -154,10 +165,8 @@ function Install-AllTemplatesForSolution {
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
-  # ✅ LLAMADA SIN ODATA (sin $top/$filter) para evitar el 400 que estás viendo
-  # Según docs, el List devuelve value + nextLink [1](https://stackoverflow.com/questions/74771410/how-to-fix-odata-query-returning-faulty-result-although-underlying-data-is-corre)
+  # Listado completo del catálogo (sin OData) y paginación vía nextLink [2](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_onboardingstates.html)
   $allTemplates = Get-AllPages -FirstUri $catalogTemplatesBase -MaxPages $MaxCatalogPages
-
   Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
 
   $templates = $allTemplates | Where-Object {
@@ -182,7 +191,7 @@ function Install-AllTemplatesForSolution {
       continue
     }
 
-    # Install Template: PUT contentTemplates/{templateId} [3](https://www.infosupport.com/how-to-get-azure-sentinel-incidents-via-api/)
+    # Instalar plantilla en el workspace (contentTemplates/{templateId}) [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/$templateId?api-version=$ApiVersion"
 
     $body = @{
@@ -276,7 +285,7 @@ foreach ($sol in $solutions) {
   }
 }
 
-# Confirmación: listar templates instalados (parcial) [4](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
+# Confirmación: listar templates instalados (parcial) [3](https://docs.azure.cn/en-us/sentinel/sentinel-solutions-deploy)
 Write-Host ""
 Write-Host "Listando contentTemplates instalados (muestra parcial)..."
 $listTplUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion&`$top=50"
