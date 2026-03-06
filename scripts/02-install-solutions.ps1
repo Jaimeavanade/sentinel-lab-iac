@@ -4,10 +4,7 @@ param(
   [Parameter(Mandatory = $true)][string]$SolutionsCsv,
   [string]$ApiVersion = "2025-09-01",
   [switch]$InstallAllTemplates = $true,
-
-  # Para evitar que tarde demasiado si el catálogo es enorme:
-  [int]$CatalogTopPerPage = 200,
-  [int]$MaxCatalogPages = 50
+  [int]$MaxCatalogPages = 200
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,30 +18,10 @@ function Normalize-Input {
   return $t
 }
 
-function Add-QueryParams {
-  param(
-    [Parameter(Mandatory=$true)][string]$BaseUri,
-    [Parameter(Mandatory=$true)][hashtable]$Params
-  )
-
-  $BaseUri = $BaseUri -replace '&amp;', '&'
-
-  $sep = ($BaseUri -like "*?*") ? "&" : "?"
-  $pairs = @()
-
-  foreach ($k in $Params.Keys) {
-    $v = [string]$Params[$k]
-    $enc = [System.Uri]::EscapeDataString($v)
-    $pairs += ("{0}={1}" -f $k, $enc)
-  }
-
-  return "$BaseUri$sep$($pairs -join '&')"
-}
-
 function Get-AllPages {
   param(
     [Parameter(Mandatory=$true)][string]$FirstUri,
-    [int]$MaxPages = 50
+    [int]$MaxPages = 200
   )
 
   $items = @()
@@ -53,7 +30,7 @@ function Get-AllPages {
 
   while ($uri) {
     if ($page -gt $MaxPages) {
-      Write-Warning "Se alcanzó MaxPages=$MaxPages. Corto paginación para evitar ejecución infinita."
+      Write-Warning "Se alcanzó MaxPages=$MaxPages. Corto paginación."
       break
     }
 
@@ -79,10 +56,9 @@ function Get-AllPages {
       throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
     }
 
-    $hasValue = $json.PSObject.Properties.Name -contains 'value'
-    if (-not $hasValue) {
+    if (-not ($json.PSObject.Properties.Name -contains 'value')) {
       Write-Host "  Response (raw): $($resp.Content)"
-      throw "La respuesta no tiene propiedad 'value'. No es una lista válida."
+      throw "La respuesta no tiene propiedad 'value'."
     }
 
     if ($json.value) { $items += $json.value }
@@ -125,16 +101,19 @@ $knownContentIds = @{
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
 }
 
-# 3) Base URIs de catálogo
+# 3) Catálogo
 $catalogPackagesBase  = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
+
+# IMPORTANTE: aquí NO añadimos nada de OData ($top, $filter...) porque te da 400
 $catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
   param([Parameter(Mandatory=$true)][string]$ContentId)
 
+  # Este endpoint sí te ha funcionado con $filter, lo dejamos como estaba
   $contentIdEscaped = $ContentId.Replace("'", "''")
-  $filterRaw = "properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'"
-  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{ '$filter' = $filterRaw; '$top' = '5' }
+  $filterEncoded = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'")
+  $uri = "$catalogPackagesBase&`$filter=$filterEncoded&`$top=5"
 
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $json = $resp.Content | ConvertFrom-Json
@@ -145,7 +124,9 @@ function Get-CatalogPackageByContentId {
 function Resolve-ContentIdFromDisplayNameExact {
   param([Parameter(Mandatory=$true)][string]$DisplayName)
 
-  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{ '$search' = $DisplayName; '$top' = '100' }
+  $searchEncoded = [System.Uri]::EscapeDataString($DisplayName)
+  $uri = "$catalogPackagesBase&`$search=$searchEncoded&`$top=100"
+
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $items = ($resp.Content | ConvertFrom-Json).value
   if (-not $items) { return $null }
@@ -173,17 +154,11 @@ function Install-AllTemplatesForSolution {
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
-  # ✅ IMPORTANTE: NO usamos $filter porque el servicio devuelve 400 con OData query.
-  # En su lugar listamos y filtramos localmente.
-  # El endpoint List existe y devuelve "value" y soporta paginación con nextLink. [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-templates/list?view=rest-securityinsights-2025-09-01)
+  # ✅ LLAMADA SIN ODATA (sin $top/$filter) para evitar el 400 que estás viendo
+  # Según docs, el List devuelve value + nextLink [1](https://stackoverflow.com/questions/74771410/how-to-fix-odata-query-returning-faulty-result-although-underlying-data-is-corre)
+  $allTemplates = Get-AllPages -FirstUri $catalogTemplatesBase -MaxPages $MaxCatalogPages
 
-  $firstUri = Add-QueryParams -BaseUri $catalogTemplatesBase -Params @{ '$top' = "$CatalogTopPerPage" }
-  $allTemplates = Get-AllPages -FirstUri $firstUri -MaxPages $MaxCatalogPages
-
-  if (-not $allTemplates -or $allTemplates.Count -eq 0) {
-    Write-Warning "El catálogo de contentProductTemplates vino vacío."
-    return
-  }
+  Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
 
   $templates = $allTemplates | Where-Object {
     $_.properties -and
@@ -191,11 +166,10 @@ function Install-AllTemplatesForSolution {
     $_.properties.packageKind -eq 'Solution'
   }
 
-  Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
   Write-Host "Plantillas pertenecientes a esta solución: $($templates.Count)"
 
   if (-not $templates -or $templates.Count -eq 0) {
-    Write-Warning "No encontré plantillas para la solución $SolutionPackageId. (Puede ser que esa solución no publique plantillas en este endpoint)."
+    Write-Warning "No encontré plantillas para la solución $SolutionPackageId."
     return
   }
 
@@ -208,7 +182,7 @@ function Install-AllTemplatesForSolution {
       continue
     }
 
-    # Install Template: PUT contentTemplates/{templateId} [2](https://www.infosupport.com/how-to-get-azure-sentinel-incidents-via-api/)
+    # Install Template: PUT contentTemplates/{templateId} [3](https://www.infosupport.com/how-to-get-azure-sentinel-incidents-via-api/)
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/$templateId?api-version=$ApiVersion"
 
     $body = @{
@@ -272,7 +246,7 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
-  # Instalar paquete/solución (contentPackages/{packageId}) [3](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
+  # Instalar paquete/solución (contentPackages/{packageId})
   $packageId  = $contentId
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
@@ -302,11 +276,9 @@ foreach ($sol in $solutions) {
   }
 }
 
-# Confirmación: listar templates instalados (parcial) [3](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
+# Confirmación: listar templates instalados (parcial) [4](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
 Write-Host ""
 Write-Host "Listando contentTemplates instalados (muestra parcial)..."
-$listTplUri = Add-QueryParams -BaseUri "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion" -Params @{
-  '$top' = '50'
-}
+$listTplUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion&`$top=50"
 $installedTemplates = Invoke-AzRestMethod -Method GET -Uri $listTplUri
 Write-Host $installedTemplates.Content
