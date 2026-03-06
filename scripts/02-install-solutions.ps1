@@ -59,12 +59,10 @@ function Get-AllPages {
 
     $json = $resp.Content | ConvertFrom-Json
 
-    # ✅ StrictMode-safe: solo mirar .error si existe la propiedad
-    if (Has-Prop -Obj $json -Name 'error') {
-      if ($json.error) {
-        Write-Host "  Response (raw): $($resp.Content)"
-        throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
-      }
+    # ✅ StrictMode-safe: solo mirar .error si existe
+    if ((Has-Prop -Obj $json -Name 'error') -and $json.error) {
+      Write-Host "  Response (raw): $($resp.Content)"
+      throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
     }
 
     if (-not (Has-Prop -Obj $json -Name 'value')) {
@@ -74,8 +72,8 @@ function Get-AllPages {
 
     if ($json.value) { $items += $json.value }
 
-    # nextLink (si viene) para paginación [2](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_onboardingstates.html)
-    if (Has-Prop -Obj $json -Name 'nextLink' -and $json.nextLink) {
+    # ✅ ESTE ERA EL PUNTO QUE ROMPÍA: hay que envolver Has-Prop en paréntesis antes del -and
+    if ((Has-Prop -Obj $json -Name 'nextLink') -and $json.nextLink) {
       $uri = $json.nextLink
       $page++
     } else {
@@ -122,6 +120,7 @@ $catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resou
 function Get-CatalogPackageByContentId {
   param([Parameter(Mandatory=$true)][string]$ContentId)
 
+  # Este endpoint sí te funciona con $filter
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterEncoded = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'")
   $uri = "$catalogPackagesBase&`$filter=$filterEncoded&`$top=5"
@@ -165,7 +164,6 @@ function Install-AllTemplatesForSolution {
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
-  # Listado completo del catálogo (sin OData) y paginación vía nextLink [2](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_onboardingstates.html)
   $allTemplates = Get-AllPages -FirstUri $catalogTemplatesBase -MaxPages $MaxCatalogPages
   Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
 
@@ -191,7 +189,6 @@ function Install-AllTemplatesForSolution {
       continue
     }
 
-    # Instalar plantilla en el workspace (contentTemplates/{templateId}) [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/$templateId?api-version=$ApiVersion"
 
     $body = @{
@@ -255,7 +252,6 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
-  # Instalar paquete/solución (contentPackages/{packageId})
   $packageId  = $contentId
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
@@ -285,7 +281,6 @@ foreach ($sol in $solutions) {
   }
 }
 
-# Confirmación: listar templates instalados (parcial) [3](https://docs.azure.cn/en-us/sentinel/sentinel-solutions-deploy)
 Write-Host ""
 Write-Host "Listando contentTemplates instalados (muestra parcial)..."
 $listTplUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion&`$top=50"
