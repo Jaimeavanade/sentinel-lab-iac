@@ -24,7 +24,7 @@ function Normalize-Input {
 # ---- Inputs ----
 $SolutionsCsv = Normalize-Input -Text $SolutionsCsv
 
-# split robusto: soporta espacios alrededor de la coma
+# Split robusto: soporta espacios alrededor de la coma
 $solutions = $SolutionsCsv -split '\s*,\s*' |
   ForEach-Object { Normalize-Input -Text $_ } |
   Where-Object { $_ } |
@@ -32,6 +32,7 @@ $solutions = $SolutionsCsv -split '\s*,\s*' |
 
 Write-Host "Instalación de soluciones solicitadas: $($solutions -join ' | ')"
 
+# Contexto Az (debe existir por azure/login con enable-AzPSSession=true)
 $ctx = Get-AzContext
 if (-not $ctx) { throw "No hay contexto Az. Revisa azure/login con enable-AzPSSession=true." }
 $subId = $ctx.Subscription.Id
@@ -44,7 +45,8 @@ if ($check.StatusCode -ne 200) {
 }
 Write-Host "OK: Sentinel habilitado. Continuamos con instalación."
 
-# 2) Mapeo estable (evita falsos positivos tipo 1Password)
+# 2) Mapeo estable displayName -> contentId (evita falsos positivos)
+# Puedes añadir más aquí si quieres soportar más soluciones de forma “exacta”.
 $knownContentIds = @{
   "Azure Activity" = "azuresentinel.azure-sentinel-solution-azureactivity"
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
@@ -55,13 +57,14 @@ $catalogBase = "https://management.azure.com/subscriptions/$subId/resourceGroups
 
 function Get-CatalogPackageByContentId {
   param(
-    [Parameter(Mandatory=$true)][string]$ContentId
+    [Parameter(Mandatory = $true)][string]$ContentId
   )
 
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterRaw = "properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'"
   $filterEncoded = [System.Uri]::EscapeDataString($filterRaw)
 
+  # IMPORTANTE: usar '&' real, NO '&amp;'
   $uri = "$catalogBase&`$filter=$filterEncoded&`$top=5"
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $json = $resp.Content | ConvertFrom-Json
@@ -72,11 +75,13 @@ function Get-CatalogPackageByContentId {
 
 function Resolve-ContentIdFromDisplayNameExact {
   param(
-    [Parameter(Mandatory=$true)][string]$DisplayName
+    [Parameter(Mandatory = $true)][string]$DisplayName
   )
 
   # Usamos $search (substring) y luego filtramos exacto en PowerShell
   $searchEncoded = [System.Uri]::EscapeDataString($DisplayName)
+
+  # IMPORTANTE: usar '&' real, NO '&amp;'
   $uri = "$catalogBase&`$search=$searchEncoded&`$top=100"
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $items = ($resp.Content | ConvertFrom-Json).value
@@ -117,7 +122,8 @@ foreach ($sol in $solutions) {
     $contentId = Resolve-ContentIdFromDisplayNameExact -DisplayName $sol
     if ($contentId) {
       Write-Host "Resuelto por displayName exacto -> contentId: $contentId"
-    } else {
+    }
+    else {
       Write-Warning "No pude resolver '$sol' en el catálogo (displayName exacto). Añádelo a knownContentIds o revisa el nombre."
       continue
     }
@@ -138,8 +144,10 @@ foreach ($sol in $solutions) {
   Write-Host "Catálogo OK: displayName='$displayName' version=$version contentProductId=$contentProductId"
 
   # 4) Instalar paquete (PUT contentPackages/{packageId})
-  $packageId = $contentId
-  $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/$packageId?api-version=$ApiVersion"
+  $packageId  = $contentId
+
+  # MUY IMPORTANTE: ${packageId} antes de '?api-version' para evitar $packageId?api
+  $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
   $installBody = @{
     properties = @{
@@ -151,10 +159,16 @@ foreach ($sol in $solutions) {
     }
   } | ConvertTo-Json -Depth 10
 
+  # --- DIAGNÓSTICO: capturar respuesta y mostrarla en el log ---
   $result = Invoke-AzRestMethod -Method PUT -Uri $installUri -Payload $installBody
 
-  if ($result.StatusCode -notin 200,201) {
-    throw "Falló instalación de '$displayName'. StatusCode=$($result.StatusCode). Body=$($result.Content)"
+  Write-Host "Install StatusCode: $($result.StatusCode)"
+  if ($result.Content) {
+    Write-Host "Install Response (raw): $($result.Content)"
+  }
+
+  if ($result.StatusCode -notin 200, 201) {
+    throw "Falló instalación de '$displayName'. StatusCode=$($result.StatusCode)"
   }
 
   Write-Host "OK: Instalado/actualizado -> $displayName"
