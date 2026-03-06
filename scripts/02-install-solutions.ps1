@@ -3,7 +3,11 @@ param(
   [Parameter(Mandatory = $true)][string]$WorkspaceName,
   [Parameter(Mandatory = $true)][string]$SolutionsCsv,
   [string]$ApiVersion = "2025-09-01",
-  [switch]$InstallAllTemplates = $true
+  [switch]$InstallAllTemplates = $true,
+
+  # Para evitar que tarde demasiado si el catálogo es enorme:
+  [int]$CatalogTopPerPage = 200,
+  [int]$MaxCatalogPages = 50
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,14 +21,12 @@ function Normalize-Input {
   return $t
 }
 
-# Construye URLs SIEMPRE con '&' normal (nunca '&amp;') y encodea valores correctamente
 function Add-QueryParams {
   param(
     [Parameter(Mandatory=$true)][string]$BaseUri,
     [Parameter(Mandatory=$true)][hashtable]$Params
   )
 
-  # Si alguien pegó '&amp;' lo arreglamos automáticamente
   $BaseUri = $BaseUri -replace '&amp;', '&'
 
   $sep = ($BaseUri -like "*?*") ? "&" : "?"
@@ -32,13 +34,7 @@ function Add-QueryParams {
 
   foreach ($k in $Params.Keys) {
     $v = [string]$Params[$k]
-
-    # Encode seguro para valores; en $filter dejamos "/" sin encodear para evitar problemas OData
     $enc = [System.Uri]::EscapeDataString($v)
-    if ($k -eq '$filter' -or $k -eq '$search') {
-      $enc = $enc -replace '%2F','/'  # evita líos con properties/packageId
-    }
-
     $pairs += ("{0}={1}" -f $k, $enc)
   }
 
@@ -46,13 +42,21 @@ function Add-QueryParams {
 }
 
 function Get-AllPages {
-  param([Parameter(Mandatory=$true)][string]$FirstUri)
+  param(
+    [Parameter(Mandatory=$true)][string]$FirstUri,
+    [int]$MaxPages = 50
+  )
 
   $items = @()
   $uri = $FirstUri
   $page = 1
 
   while ($uri) {
+    if ($page -gt $MaxPages) {
+      Write-Warning "Se alcanzó MaxPages=$MaxPages. Corto paginación para evitar ejecución infinita."
+      break
+    }
+
     $uri = $uri -replace '&amp;', '&'
     Write-Host "GET (page $page): $uri"
 
@@ -130,15 +134,10 @@ function Get-CatalogPackageByContentId {
 
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterRaw = "properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'"
-
-  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{
-    '$filter' = $filterRaw
-    '$top'    = '5'
-  }
+  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{ '$filter' = $filterRaw; '$top' = '5' }
 
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $json = $resp.Content | ConvertFrom-Json
-
   if (-not $json.value -or $json.value.Count -eq 0) { return $null }
   return ($json.value | Select-Object -First 1)
 }
@@ -146,11 +145,7 @@ function Get-CatalogPackageByContentId {
 function Resolve-ContentIdFromDisplayNameExact {
   param([Parameter(Mandatory=$true)][string]$DisplayName)
 
-  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{
-    '$search' = $DisplayName
-    '$top'    = '100'
-  }
-
+  $uri = Add-QueryParams -BaseUri $catalogPackagesBase -Params @{ '$search' = $DisplayName; '$top' = '100' }
   $resp = Invoke-AzRestMethod -Method GET -Uri $uri
   $items = ($resp.Content | ConvertFrom-Json).value
   if (-not $items) { return $null }
@@ -178,23 +173,31 @@ function Install-AllTemplatesForSolution {
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
-  $pkgIdEscaped = $SolutionPackageId.Replace("'", "''")
-  $filterRaw = "properties/packageId eq '$pkgIdEscaped'"
+  # ✅ IMPORTANTE: NO usamos $filter porque el servicio devuelve 400 con OData query.
+  # En su lugar listamos y filtramos localmente.
+  # El endpoint List existe y devuelve "value" y soporta paginación con nextLink. [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-templates/list?view=rest-securityinsights-2025-09-01)
 
-  # Catálogo de plantillas (List) soporta $filter y $top [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package?view=rest-securityinsights-2025-09-01)
-  $firstUri = Add-QueryParams -BaseUri $catalogTemplatesBase -Params @{
-    '$filter' = $filterRaw
-    '$top'    = '100'
-  }
+  $firstUri = Add-QueryParams -BaseUri $catalogTemplatesBase -Params @{ '$top' = "$CatalogTopPerPage" }
+  $allTemplates = Get-AllPages -FirstUri $firstUri -MaxPages $MaxCatalogPages
 
-  $templates = Get-AllPages -FirstUri $firstUri
-
-  if (-not $templates -or $templates.Count -eq 0) {
-    Write-Warning "No encontré plantillas en el catálogo para packageId=$SolutionPackageId."
+  if (-not $allTemplates -or $allTemplates.Count -eq 0) {
+    Write-Warning "El catálogo de contentProductTemplates vino vacío."
     return
   }
 
-  Write-Host "Plantillas encontradas en catálogo: $($templates.Count)"
+  $templates = $allTemplates | Where-Object {
+    $_.properties -and
+    $_.properties.packageId -eq $SolutionPackageId -and
+    $_.properties.packageKind -eq 'Solution'
+  }
+
+  Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
+  Write-Host "Plantillas pertenecientes a esta solución: $($templates.Count)"
+
+  if (-not $templates -or $templates.Count -eq 0) {
+    Write-Warning "No encontré plantillas para la solución $SolutionPackageId. (Puede ser que esa solución no publique plantillas en este endpoint)."
+    return
+  }
 
   foreach ($t in $templates) {
     $templateId = $t.name
@@ -266,10 +269,10 @@ foreach ($sol in $solutions) {
   Write-Host "Catálogo OK: displayName='$displayName' version=$version contentProductId=$contentProductId contentSchemaVersion=$contentSchemaVersion"
 
   if ([string]::IsNullOrWhiteSpace($contentSchemaVersion)) {
-    throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'. No puedo instalar sin ese valor."
+    throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
-  # Instalar paquete (solución)
+  # Instalar paquete/solución (contentPackages/{packageId}) [3](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
   $packageId  = $contentId
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
@@ -299,6 +302,7 @@ foreach ($sol in $solutions) {
   }
 }
 
+# Confirmación: listar templates instalados (parcial) [3](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_contentproductpackages.html)
 Write-Host ""
 Write-Host "Listando contentTemplates instalados (muestra parcial)..."
 $listTplUri = Add-QueryParams -BaseUri "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion" -Params @{
