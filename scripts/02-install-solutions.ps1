@@ -21,22 +21,59 @@ function Get-AllPages {
   param(
     [Parameter(Mandatory=$true)][string]$FirstUri
   )
+
   $items = @()
   $uri = $FirstUri
+  $page = 1
 
   while ($uri) {
+    Write-Host "GET (page $page): $uri"
+
     $resp = Invoke-AzRestMethod -Method GET -Uri $uri
+    Write-Host "  StatusCode: $($resp.StatusCode)"
+
+    if ($resp.StatusCode -ne 200) {
+      if ($resp.Content) { Write-Host "  Response (raw): $($resp.Content)" }
+      throw "Error llamando al API. StatusCode=$($resp.StatusCode)"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($resp.Content)) {
+      throw "El API devolvió Content vacío. No puedo leer JSON."
+    }
+
     $json = $resp.Content | ConvertFrom-Json
+
+    # Caso A: el API devuelve un array directamente
+    if ($json -is [System.Array]) {
+      $items += $json
+      $uri = $null
+      break
+    }
+
+    # Caso B: el API devuelve { error: {...} }
+    if ($json.error) {
+      Write-Host "  Response (raw): $($resp.Content)"
+      throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
+    }
+
+    # Caso C: respuesta "List" típica con .value
+    $hasValue = $json.PSObject.Properties.Name -contains 'value'
+    if (-not $hasValue) {
+      Write-Host "  Response (raw): $($resp.Content)"
+      throw "La respuesta no tiene propiedad 'value'. No es una lista válida."
+    }
 
     if ($json.value) { $items += $json.value }
 
-    # Muchos endpoints devuelven nextLink para paginación
     if ($json.nextLink) {
       $uri = $json.nextLink
-    } else {
+      $page++
+    }
+    else {
       $uri = $null
     }
   }
+
   return $items
 }
 
@@ -67,10 +104,10 @@ $knownContentIds = @{
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
 }
 
-# 3) Catálogo: contentProductPackages (para obtener versión, contentProductId, contentSchemaVersion)
+# 3) Catálogo de paquetes (para instalar la solución)
 $catalogPackagesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
-# Catálogo: contentProductTemplates (para obtener todas las plantillas de una solución)
+# Catálogo de plantillas (para traer todos los content types)
 $catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
@@ -117,23 +154,24 @@ function Resolve-ContentIdFromDisplayNameExact {
 
 function Install-AllTemplatesForSolution {
   param(
-    [Parameter(Mandatory=$true)][string]$SolutionPackageId,
-    [Parameter(Mandatory=$true)][string]$SolutionPackageVersion
+    [Parameter(Mandatory=$true)][string]$SolutionPackageId
   )
 
   Write-Host ""
-  Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId (v$SolutionPackageVersion) ----"
+  Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
   # Filtrar plantillas del catálogo por packageId (la solución)
   $pkgIdEscaped = $SolutionPackageId.Replace("'", "''")
   $filterRaw = "properties/packageId eq '$pkgIdEscaped'"
   $filterEncoded = [System.Uri]::EscapeDataString($filterRaw)
 
-  $firstUri = "$catalogTemplatesBase&`$filter=$filterEncoded&`$top=500"
+  # IMPORTANTE: top moderado + paginación con nextLink
+  $firstUri = "$catalogTemplatesBase&`$filter=$filterEncoded&`$top=100"
+
   $templates = Get-AllPages -FirstUri $firstUri
 
   if (-not $templates -or $templates.Count -eq 0) {
-    Write-Warning "No encontré plantillas en el catálogo para packageId=$SolutionPackageId. (Puede ser paginación, permisos o que la solución no exponga plantillas)."
+    Write-Warning "No encontré plantillas en el catálogo para packageId=$SolutionPackageId."
     return
   }
 
@@ -143,11 +181,14 @@ function Install-AllTemplatesForSolution {
     $templateId = $t.name
     $p = $t.properties
 
-    # Endpoint de instalación de template en el workspace
+    if (-not $templateId) {
+      Write-Warning "  Saltando: item sin 'name' (templateId)."
+      continue
+    }
+
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/$templateId?api-version=$ApiVersion"
 
-    # Body requerido por Install Template
-    # (incluimos contentSchemaVersion para evitar errores como el que ya viste en paquetes)
+    # Body requerido para instalar plantilla
     $body = @{
       properties = @{
         contentId            = $p.contentId
@@ -160,14 +201,16 @@ function Install-AllTemplatesForSolution {
         version              = $p.version
         contentSchemaVersion = $p.contentSchemaVersion
       }
-    } | ConvertTo-Json -Depth 20
+    } | ConvertTo-Json -Depth 25
 
     $r = Invoke-AzRestMethod -Method PUT -Uri $installTemplateUri -Payload $body
 
-    if ($r.StatusCode -in 200,201) {
+    if ($r.StatusCode -in 200, 201) {
       Write-Host "  OK Template: $($p.contentKind) -> $($p.displayName)"
-    } else {
-      Write-Warning "  FAIL Template: $($p.displayName) StatusCode=$($r.StatusCode) Response=$($r.Content)"
+    }
+    else {
+      Write-Warning "  FAIL Template: $($p.displayName) StatusCode=$($r.StatusCode)"
+      if ($r.Content) { Write-Host "  Response (raw): $($r.Content)" }
     }
   }
 }
@@ -180,17 +223,18 @@ foreach ($sol in $solutions) {
   if ($knownContentIds.ContainsKey($sol)) {
     $contentId = $knownContentIds[$sol]
     Write-Host "Usando contentId estable (mapeado): $contentId"
-  } else {
+  }
+  else {
     $contentId = Resolve-ContentIdFromDisplayNameExact -DisplayName $sol
     if ($contentId) {
       Write-Host "Resuelto por displayName exacto -> contentId: $contentId"
-    } else {
+    }
+    else {
       Write-Warning "No pude resolver '$sol' en el catálogo (displayName exacto)."
       continue
     }
   }
 
-  # Obtener datos de paquete del catálogo (para instalar paquete)
   $pkg = Get-CatalogPackageByContentId -ContentId $contentId
   if (-not $pkg) {
     Write-Warning "No encontrado en catálogo (contentId): $contentId"
@@ -209,7 +253,7 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'. No puedo instalar sin ese valor."
   }
 
-  # Instalar paquete (solución)
+  # Instalar paquete/solución
   $packageId  = $contentId
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
@@ -235,9 +279,9 @@ foreach ($sol in $solutions) {
 
   Write-Host "OK: Solución instalada/actualizada -> $displayName"
 
-  # Instalar todas las plantillas (content types) de la solución
+  # Instalar todas las plantillas/content types de esa solución
   if ($InstallAllTemplates) {
-    Install-AllTemplatesForSolution -SolutionPackageId $packageId -SolutionPackageVersion $version
+    Install-AllTemplatesForSolution -SolutionPackageId $packageId
   }
 }
 
