@@ -38,14 +38,10 @@ function Invoke-RestWithRetry {
   while ($true) {
     $attempt++
     try {
-      if ($Payload) {
-        return Invoke-AzRestMethod -Method $Method -Uri $Uri -Payload $Payload
-      } else {
-        return Invoke-AzRestMethod -Method $Method -Uri $Uri
-      }
+      if ($Payload) { return Invoke-AzRestMethod -Method $Method -Uri $Uri -Payload $Payload }
+      else { return Invoke-AzRestMethod -Method $Method -Uri $Uri }
     }
     catch {
-      # Si Invoke-AzRestMethod lanza excepción, puede no darnos StatusCode. Reintentamos con backoff.
       if ($attempt -ge $MaxRetries) { throw }
       Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
     }
@@ -135,10 +131,10 @@ $knownContentIds = @{
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
 }
 
-# 3) Catálogo
+# 3) Catálogo (packages)
 $catalogPackagesBase  = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
-# IMPORTANTE: para contentProductTemplates no usamos OData ($top/$filter) en tu caso.
+# Catálogo (templates) - sin OData porque en tu caso da problemas con OData
 $catalogTemplatesListUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
@@ -184,12 +180,13 @@ function Resolve-ContentIdFromDisplayNameExact {
 function Get-ProductTemplateById {
   param([Parameter(Mandatory=$true)][string]$TemplateId)
 
-  # ✅ Product Template - Get devuelve mainTemplate en properties [3](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/securityinsights/resource-manager/Microsoft.SecurityInsights/preview/2021-10-01-preview/OnboardingStates.json)
-  $uri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates/${TemplateId}?api-version=$ApiVersion"
+  # Product Template - Get devuelve el detalle por templateId [5](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-template/get?view=rest-securityinsights-2025-09-01)
+  $uri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentproducttemplates/${TemplateId}?api-version=$ApiVersion"
   $resp = Invoke-RestWithRetry -Method GET -Uri $uri
 
   if ($resp.StatusCode -ne 200) {
-    Write-Warning "No pude obtener detalle de templateId=$TemplateId. StatusCode=$($resp.StatusCode) Body=$($resp.Content)"
+    Write-Warning "No pude obtener detalle de templateId=$TemplateId. StatusCode=$($resp.StatusCode)"
+    if ($resp.Content) { Write-Host "  Body: $($resp.Content)" }
     return $null
   }
 
@@ -225,19 +222,30 @@ function Install-AllTemplatesForSolution {
       continue
     }
 
-    # ✅ Traemos el template completo para obtener properties.mainTemplate [3](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/securityinsights/resource-manager/Microsoft.SecurityInsights/preview/2021-10-01-preview/OnboardingStates.json)
+    # Traer detalle completo del product template (para obtener mainTemplate o packagedContent) [5](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-template/get?view=rest-securityinsights-2025-09-01)
     $full = Get-ProductTemplateById -TemplateId $templateId
     if (-not $full) { continue }
 
     $p = $full.properties
+    $display = $p.displayName
 
-    # Si por alguna razón aún no hay mainTemplate, lo saltamos.
-    if (-not (Has-Prop -Obj $p -Name 'mainTemplate') -or -not $p.mainTemplate) {
-      Write-Warning "  SKIP Template (sin mainTemplate): $($p.displayName)"
+    # ✅ mainTemplate puede venir como properties.mainTemplate
+    # ✅ o puede venir como properties.packagedContent (ARM template empaquetado) [1](https://www.azadvertizer.net/azresourcetypes/microsoft.securityinsights_onboardingstates.html)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-templates/list?view=rest-securityinsights-2025-09-01)
+    $main = $null
+    if ((Has-Prop -Obj $p -Name 'mainTemplate') -and $p.mainTemplate) {
+      $main = $p.mainTemplate
+    }
+    elseif ((Has-Prop -Obj $p -Name 'packagedContent') -and $p.packagedContent) {
+      $main = $p.packagedContent
+    }
+
+    if (-not $main) {
+      Write-Warning "  SKIP Template (sin mainTemplate ni packagedContent): $display"
       continue
     }
 
-    # ✅ Install Template: PUT contentTemplates/{templateId} requiere mainTemplate (tu error lo confirma). [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)[2](https://docs.azure.cn/en-us/sentinel/create-analytics-rule-from-template)
+    # Install Template: PUT contentTemplates/{templateId}
+    # El recurso contentTemplates incluye mainTemplate, y el servicio lo exige [3](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)[4](https://docs.azure.cn/en-us/sentinel/create-analytics-rule-from-template)
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/${templateId}?api-version=$ApiVersion"
 
     $props = @{
@@ -250,15 +258,15 @@ function Install-AllTemplatesForSolution {
       source               = $p.source
       version              = $p.version
       contentSchemaVersion = $p.contentSchemaVersion
-      mainTemplate         = $p.mainTemplate
+      mainTemplate         = $main
     }
 
-    # opcional: si existen dependantTemplates, las enviamos (no siempre vienen)
-    if (Has-Prop -Obj $p -Name 'dependantTemplates' -and $p.dependantTemplates) {
+    # (Opcional) dependantTemplates si existen
+    if ((Has-Prop -Obj $p -Name 'dependantTemplates') -and $p.dependantTemplates) {
       $props.dependantTemplates = $p.dependantTemplates
     }
 
-    $body = @{ properties = $props } | ConvertTo-Json -Depth 50
+    $body = @{ properties = $props } | ConvertTo-Json -Depth 60
 
     $r = Invoke-RestWithRetry -Method PUT -Uri $installTemplateUri -Payload $body
 
@@ -307,7 +315,7 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
-  # Instalar paquete/solución (contentPackages/{packageId})
+  # Instalar solución (contentPackages/{packageId})
   $packageId  = $contentId
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
