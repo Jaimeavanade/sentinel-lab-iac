@@ -26,6 +26,32 @@ function Has-Prop {
   return ($null -ne $Obj) -and ($Obj.PSObject.Properties.Name -contains $Name)
 }
 
+function Invoke-RestWithRetry {
+  param(
+    [Parameter(Mandatory=$true)][ValidateSet('GET','PUT','POST','DELETE')] [string]$Method,
+    [Parameter(Mandatory=$true)][string]$Uri,
+    [string]$Payload,
+    [int]$MaxRetries = 6
+  )
+
+  $attempt = 0
+  while ($true) {
+    $attempt++
+    try {
+      if ($Payload) {
+        return Invoke-AzRestMethod -Method $Method -Uri $Uri -Payload $Payload
+      } else {
+        return Invoke-AzRestMethod -Method $Method -Uri $Uri
+      }
+    }
+    catch {
+      # Si Invoke-AzRestMethod lanza excepción, puede no darnos StatusCode. Reintentamos con backoff.
+      if ($attempt -ge $MaxRetries) { throw }
+      Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
+    }
+  }
+}
+
 function Get-AllPages {
   param(
     [Parameter(Mandatory=$true)][string]$FirstUri,
@@ -45,7 +71,7 @@ function Get-AllPages {
     $uri = $uri -replace '&amp;', '&'
     Write-Host "GET (page $page): $uri"
 
-    $resp = Invoke-AzRestMethod -Method GET -Uri $uri
+    $resp = Invoke-RestWithRetry -Method GET -Uri $uri
     Write-Host "  StatusCode: $($resp.StatusCode)"
 
     if ($resp.StatusCode -ne 200) {
@@ -59,7 +85,6 @@ function Get-AllPages {
 
     $json = $resp.Content | ConvertFrom-Json
 
-    # StrictMode-safe: solo mirar .error si existe
     if ((Has-Prop -Obj $json -Name 'error') -and $json.error) {
       Write-Host "  Response (raw): $($resp.Content)"
       throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
@@ -72,7 +97,6 @@ function Get-AllPages {
 
     if ($json.value) { $items += $json.value }
 
-    # IMPORTANTE: paréntesis para que -and sea operador y no 'parámetro'
     if ((Has-Prop -Obj $json -Name 'nextLink') -and $json.nextLink) {
       $uri = $json.nextLink
       $page++
@@ -99,13 +123,13 @@ $subId = $ctx.Subscription.Id
 
 # 1) Comprobar Sentinel habilitado
 $onboardUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/onboardingStates/default?api-version=$ApiVersion"
-$check = Invoke-AzRestMethod -Method GET -Uri $onboardUri
+$check = Invoke-RestWithRetry -Method GET -Uri $onboardUri
 if ($check.StatusCode -ne 200) {
   throw "Sentinel NO está habilitado (GET onboardingStates/default no devuelve 200)."
 }
 Write-Host "OK: Sentinel habilitado. Continuamos con instalación."
 
-# 2) Mapeo estable (puedes añadir más)
+# 2) Mapeo estable
 $knownContentIds = @{
   "Azure Activity" = "azuresentinel.azure-sentinel-solution-azureactivity"
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
@@ -114,18 +138,17 @@ $knownContentIds = @{
 # 3) Catálogo
 $catalogPackagesBase  = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
-# IMPORTANTE: para contentProductTemplates NO usamos OData ($top/$filter) porque en tu caso devolvía 400.
-$catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
+# IMPORTANTE: para contentProductTemplates no usamos OData ($top/$filter) en tu caso.
+$catalogTemplatesListUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
   param([Parameter(Mandatory=$true)][string]$ContentId)
 
-  # Este endpoint sí te funcionó con $filter
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterEncoded = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'")
   $uri = "$catalogPackagesBase&`$filter=$filterEncoded&`$top=5"
 
-  $resp = Invoke-AzRestMethod -Method GET -Uri $uri
+  $resp = Invoke-RestWithRetry -Method GET -Uri $uri
   $json = $resp.Content | ConvertFrom-Json
   if (-not $json.value -or $json.value.Count -eq 0) { return $null }
   return ($json.value | Select-Object -First 1)
@@ -137,7 +160,7 @@ function Resolve-ContentIdFromDisplayNameExact {
   $searchEncoded = [System.Uri]::EscapeDataString($DisplayName)
   $uri = "$catalogPackagesBase&`$search=$searchEncoded&`$top=100"
 
-  $resp = Invoke-AzRestMethod -Method GET -Uri $uri
+  $resp = Invoke-RestWithRetry -Method GET -Uri $uri
   $items = ($resp.Content | ConvertFrom-Json).value
   if (-not $items) { return $null }
 
@@ -158,14 +181,28 @@ function Resolve-ContentIdFromDisplayNameExact {
   return $best.properties.contentId
 }
 
+function Get-ProductTemplateById {
+  param([Parameter(Mandatory=$true)][string]$TemplateId)
+
+  # ✅ Product Template - Get devuelve mainTemplate en properties [3](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/securityinsights/resource-manager/Microsoft.SecurityInsights/preview/2021-10-01-preview/OnboardingStates.json)
+  $uri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates/${TemplateId}?api-version=$ApiVersion"
+  $resp = Invoke-RestWithRetry -Method GET -Uri $uri
+
+  if ($resp.StatusCode -ne 200) {
+    Write-Warning "No pude obtener detalle de templateId=$TemplateId. StatusCode=$($resp.StatusCode) Body=$($resp.Content)"
+    return $null
+  }
+
+  return ($resp.Content | ConvertFrom-Json)
+}
+
 function Install-AllTemplatesForSolution {
   param([Parameter(Mandatory=$true)][string]$SolutionPackageId)
 
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
-  # Listado completo del catálogo (sin OData) y paginación vía nextLink
-  $allTemplates = Get-AllPages -FirstUri $catalogTemplatesBase -MaxPages $MaxCatalogPages
+  $allTemplates = Get-AllPages -FirstUri $catalogTemplatesListUri -MaxPages $MaxCatalogPages
   Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
 
   $templates = $allTemplates | Where-Object {
@@ -183,32 +220,47 @@ function Install-AllTemplatesForSolution {
 
   foreach ($t in $templates) {
     $templateId = $t.name
-    $p = $t.properties
-
     if (-not $templateId) {
       Write-Warning "  Saltando: item sin 'name' (templateId)."
       continue
     }
 
-    # ✅ FIX CLAVE: usar ${templateId} antes de ?api-version (evita $templateId?api)
-    # Endpoint: PUT contentTemplates/{templateId} (Install Template) [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)
+    # ✅ Traemos el template completo para obtener properties.mainTemplate [3](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/securityinsights/resource-manager/Microsoft.SecurityInsights/preview/2021-10-01-preview/OnboardingStates.json)
+    $full = Get-ProductTemplateById -TemplateId $templateId
+    if (-not $full) { continue }
+
+    $p = $full.properties
+
+    # Si por alguna razón aún no hay mainTemplate, lo saltamos.
+    if (-not (Has-Prop -Obj $p -Name 'mainTemplate') -or -not $p.mainTemplate) {
+      Write-Warning "  SKIP Template (sin mainTemplate): $($p.displayName)"
+      continue
+    }
+
+    # ✅ Install Template: PUT contentTemplates/{templateId} requiere mainTemplate (tu error lo confirma). [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)[2](https://docs.azure.cn/en-us/sentinel/create-analytics-rule-from-template)
     $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/${templateId}?api-version=$ApiVersion"
 
-    $body = @{
-      properties = @{
-        contentId            = $p.contentId
-        contentKind          = $p.contentKind
-        contentProductId     = $p.contentProductId
-        displayName          = $p.displayName
-        packageId            = $p.packageId
-        packageVersion       = $p.packageVersion
-        source               = $p.source
-        version              = $p.version
-        contentSchemaVersion = $p.contentSchemaVersion
-      }
-    } | ConvertTo-Json -Depth 25
+    $props = @{
+      contentId            = $p.contentId
+      contentKind          = $p.contentKind
+      contentProductId     = $p.contentProductId
+      displayName          = $p.displayName
+      packageId            = $p.packageId
+      packageVersion       = $p.packageVersion
+      source               = $p.source
+      version              = $p.version
+      contentSchemaVersion = $p.contentSchemaVersion
+      mainTemplate         = $p.mainTemplate
+    }
 
-    $r = Invoke-AzRestMethod -Method PUT -Uri $installTemplateUri -Payload $body
+    # opcional: si existen dependantTemplates, las enviamos (no siempre vienen)
+    if (Has-Prop -Obj $p -Name 'dependantTemplates' -and $p.dependantTemplates) {
+      $props.dependantTemplates = $p.dependantTemplates
+    }
+
+    $body = @{ properties = $props } | ConvertTo-Json -Depth 50
+
+    $r = Invoke-RestWithRetry -Method PUT -Uri $installTemplateUri -Payload $body
 
     if ($r.StatusCode -in 200, 201) {
       Write-Host "  OK Template: $($p.contentKind) -> $($p.displayName)"
@@ -255,10 +307,8 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
-  # Instalar paquete/solución
+  # Instalar paquete/solución (contentPackages/{packageId})
   $packageId  = $contentId
-
-  # ✅ Importante: ${packageId} antes de ?api-version
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
   $installBody = @{
@@ -272,7 +322,7 @@ foreach ($sol in $solutions) {
     }
   } | ConvertTo-Json -Depth 10
 
-  $result = Invoke-AzRestMethod -Method PUT -Uri $installUri -Payload $installBody
+  $result = Invoke-RestWithRetry -Method PUT -Uri $installUri -Payload $installBody
   Write-Host "Install Package StatusCode: $($result.StatusCode)"
   if ($result.Content) { Write-Host "Install Package Response (raw): $($result.Content)" }
 
@@ -290,5 +340,5 @@ foreach ($sol in $solutions) {
 Write-Host ""
 Write-Host "Listando contentTemplates instalados (muestra parcial)..."
 $listTplUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates?api-version=$ApiVersion&`$top=50"
-$installedTemplates = Invoke-AzRestMethod -Method GET -Uri $listTplUri
+$installedTemplates = Invoke-RestWithRetry -Method GET -Uri $listTplUri
 Write-Host $installedTemplates.Content
