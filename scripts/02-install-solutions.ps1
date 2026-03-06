@@ -59,7 +59,7 @@ function Get-AllPages {
 
     $json = $resp.Content | ConvertFrom-Json
 
-    # ✅ StrictMode-safe: solo mirar .error si existe
+    # StrictMode-safe: solo mirar .error si existe
     if ((Has-Prop -Obj $json -Name 'error') -and $json.error) {
       Write-Host "  Response (raw): $($resp.Content)"
       throw "El API devolvió error: $($json.error.code) - $($json.error.message)"
@@ -72,7 +72,7 @@ function Get-AllPages {
 
     if ($json.value) { $items += $json.value }
 
-    # ✅ ESTE ERA EL PUNTO QUE ROMPÍA: hay que envolver Has-Prop en paréntesis antes del -and
+    # IMPORTANTE: paréntesis para que -and sea operador y no 'parámetro'
     if ((Has-Prop -Obj $json -Name 'nextLink') -and $json.nextLink) {
       $uri = $json.nextLink
       $page++
@@ -105,7 +105,7 @@ if ($check.StatusCode -ne 200) {
 }
 Write-Host "OK: Sentinel habilitado. Continuamos con instalación."
 
-# 2) Mapeo estable
+# 2) Mapeo estable (puedes añadir más)
 $knownContentIds = @{
   "Azure Activity" = "azuresentinel.azure-sentinel-solution-azureactivity"
   "Syslog"         = "azuresentinel.azure-sentinel-solution-syslog"
@@ -114,13 +114,13 @@ $knownContentIds = @{
 # 3) Catálogo
 $catalogPackagesBase  = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
-# IMPORTANTE: para contentProductTemplates NO usamos OData ($top/$filter) porque te devolvía 400.
+# IMPORTANTE: para contentProductTemplates NO usamos OData ($top/$filter) porque en tu caso devolvía 400.
 $catalogTemplatesBase = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductTemplates?api-version=$ApiVersion"
 
 function Get-CatalogPackageByContentId {
   param([Parameter(Mandatory=$true)][string]$ContentId)
 
-  # Este endpoint sí te funciona con $filter
+  # Este endpoint sí te funcionó con $filter
   $contentIdEscaped = $ContentId.Replace("'", "''")
   $filterEncoded = [System.Uri]::EscapeDataString("properties/contentKind eq 'Solution' and properties/contentId eq '$contentIdEscaped'")
   $uri = "$catalogPackagesBase&`$filter=$filterEncoded&`$top=5"
@@ -164,6 +164,7 @@ function Install-AllTemplatesForSolution {
   Write-Host ""
   Write-Host "---- Instalando TODAS las plantillas (content types) del paquete: $SolutionPackageId ----"
 
+  # Listado completo del catálogo (sin OData) y paginación vía nextLink
   $allTemplates = Get-AllPages -FirstUri $catalogTemplatesBase -MaxPages $MaxCatalogPages
   Write-Host "Total plantillas en catálogo (escaneadas): $($allTemplates.Count)"
 
@@ -189,7 +190,9 @@ function Install-AllTemplatesForSolution {
       continue
     }
 
-    $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/$templateId?api-version=$ApiVersion"
+    # ✅ FIX CLAVE: usar ${templateId} antes de ?api-version (evita $templateId?api)
+    # Endpoint: PUT contentTemplates/{templateId} (Install Template) [1](https://github.com/Azure/Azure-Sentinel/blob/master/Tools/PowerShell/Create-AnalyticsRulesFromTemplates/Create-AnalyticsRulesFromTemplates.ps1)
+    $installTemplateUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentTemplates/${templateId}?api-version=$ApiVersion"
 
     $body = @{
       properties = @{
@@ -252,7 +255,10 @@ foreach ($sol in $solutions) {
     throw "El catálogo no devolvió properties.contentSchemaVersion para '$displayName'."
   }
 
+  # Instalar paquete/solución
   $packageId  = $contentId
+
+  # ✅ Importante: ${packageId} antes de ?api-version
   $installUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
   $installBody = @{
