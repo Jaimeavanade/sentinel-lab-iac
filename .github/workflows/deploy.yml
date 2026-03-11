@@ -2,6 +2,23 @@ name: Deploy Log Analytics + Sentinel + Solutions
 
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Acción a ejecutar"
+        required: true
+        default: "deploy"
+        type: choice
+        options:
+          - deploy
+          - reinstall-solutions
+      solutions:
+        description: "CSV de displayName a reinstalar (vacío = todas). Ej: Microsoft Defender XDR, Azure Activity"
+        required: false
+        default: ""
+      includePreview:
+        description: "Incluir soluciones Preview (true/false)"
+        required: false
+        default: "false"
 
 permissions:
   id-token: write
@@ -9,10 +26,13 @@ permissions:
 
 jobs:
   deploy:
+    name: Deploy RG + LAW + Sentinel + Solutions
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'deploy' }}
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -21,7 +41,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           audience: api://AzureADTokenExchange
-          enable-AzPSSession: true  # clave para Az PowerShell [5](https://docs.azure.cn/en-us/sentinel/sentinel-solutions-catalog)[6](https://learn.microsoft.com/es-es/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
+          enable-AzPSSession: true
 
       - name: Create Resource Group
         uses: azure/cli@v2
@@ -43,10 +63,10 @@ jobs:
                           retentionInDays=${{ vars.RETENTION_DAYS }}
 
       - name: Onboard Sentinel
-        uses: azure/powershell@v1
+        uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
-          errorActionPreference: "Stop"
+          pwsh: true
           inlineScript: |
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
@@ -57,10 +77,10 @@ jobs:
               -MaxWaitSeconds 180
 
       - name: Install Sentinel Solutions
-        uses: azure/powershell@v1
+        uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
-          errorActionPreference: "Stop"
+          pwsh: true
           inlineScript: |
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
@@ -70,3 +90,47 @@ jobs:
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
               -SolutionsCsv "${{ vars.SENTINEL_SOLUTIONS }}"
 
+
+  reinstall_contenthub_solutions:
+    name: Reinstall Content Hub Solutions
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'reinstall-solutions' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+          enable-AzPSSession: true
+
+      - name: Reinstall solutions (Content Hub)
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          pwsh: true
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
+
+            # Parse inputs
+            $solutionsCsv = "${{ github.event.inputs.solutions }}"
+            $solutionList = @()
+            if ($solutionsCsv -and $solutionsCsv.Trim().Length -gt 0) {
+              $solutionList = $solutionsCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            }
+
+            $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
+
+            & "${{ github.workspace }}/scripts/03-reinstall-contenthub-solutions.ps1" `
+              -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
+              -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
+              -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
+              -SolutionDisplayName $solutionList `
+              -IncludePreview:($includePreview) `
+              -Verbose
