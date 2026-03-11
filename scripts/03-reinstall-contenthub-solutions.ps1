@@ -5,7 +5,7 @@ Reinstala soluciones de Microsoft Sentinel Content Hub en un workspace (Uninstal
 .DESCRIPTION
 - Obtiene los Content Packages instalados en el workspace (contentPackages).
 - Filtra los que son contentKind = 'Solution'.
-- Opcionalmente excluye contenido Preview.
+- Opcionalmente excluye contenido Preview (si el campo existe).
 - Opcionalmente filtra por displayName (lista).
 - Reinstala cada solución: DELETE (Uninstall) y PUT (Install).
 
@@ -39,13 +39,6 @@ Reintentos ante fallos transitorios (429/5xx).
 
 .PARAMETER RetryDelaySeconds
 Espera base entre reintentos.
-
-.EXAMPLE
-./03-reinstall-contenthub-solutions.ps1 -SubscriptionId xxx -ResourceGroupName rg -WorkspaceName law
-
-.EXAMPLE
-./03-reinstall-contenthub-solutions.ps1 -SubscriptionId xxx -ResourceGroupName rg -WorkspaceName law `
-  -SolutionDisplayName @("Microsoft Defender XDR","Azure Activity") -IncludePreview
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -97,6 +90,29 @@ function Get-ArmToken {
   }
 }
 
+function Test-HasProperty {
+  param(
+    [Parameter(Mandatory=$true)]
+    $Object,
+    [Parameter(Mandatory=$true)]
+    [string]$PropertyName
+  )
+  return $null -ne $Object -and $Object.PSObject.Properties.Name -contains $PropertyName
+}
+
+function Get-PreviewFlag {
+  param(
+    [Parameter(Mandatory=$true)]
+    $Package
+  )
+  # Si no existe properties o no existe isPreview => asumimos False
+  if (-not (Test-HasProperty -Object $Package -PropertyName "properties")) { return $false }
+  if (-not (Test-HasProperty -Object $Package.properties -PropertyName "isPreview")) { return $false }
+
+  # Convertimos a boolean por si viene como string/null
+  try { return [bool]$Package.properties.isPreview } catch { return $false }
+}
+
 function Invoke-ArmWithRetry {
   param(
     [Parameter(Mandatory = $true)][ValidateSet("GET","PUT","DELETE")]
@@ -125,7 +141,6 @@ function Invoke-ArmWithRetry {
         return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
       }
     } catch {
-      # Intentamos detectar fallos transitorios (429/5xx) para reintentar
       $msg = $_.Exception.Message
       $statusCode = $null
 
@@ -161,13 +176,11 @@ if ($SolutionDisplayName.Count -gt 0) {
   Write-Host "Filtro displayName: (todas)"
 }
 
-# Token ARM
 $script:ArmToken = Get-ArmToken
 
-# 1) Listar paquetes instalados (GET contentPackages) [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages/list?view=rest-securityinsights-2025-09-01)
+# 1) Listar paquetes instalados
 $listUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages?api-version=$ApiVersion"
 Write-Verbose "GET $listUri" -Verbose
-
 $installed = Invoke-ArmWithRetry -Method GET -Uri $listUri
 
 if (-not $installed.value) {
@@ -177,18 +190,24 @@ if (-not $installed.value) {
 
 # 2) Filtrar a soluciones (contentKind=Solution)
 $solutions = $installed.value | Where-Object {
+  # algunos objetos pueden no tener properties bien formadas => validamos
+  (Test-HasProperty -Object $_ -PropertyName "properties") -and
+  (Test-HasProperty -Object $_.properties -PropertyName "contentKind") -and
   $_.properties.contentKind -eq "Solution"
 }
 
-# Excluir preview si no se ha solicitado
+# 3) Excluir preview si no se ha solicitado (robusto si isPreview no existe)
 if (-not $IncludePreview) {
-  $solutions = $solutions | Where-Object { -not $_.properties.isPreview }
+  $solutions = $solutions | Where-Object { -not (Get-PreviewFlag -Package $_) }
 }
 
-# Filtrar por displayName si se proporciona
+# 4) Filtrar por displayName si se proporciona
 if ($SolutionDisplayName.Count -gt 0) {
   $wanted = $SolutionDisplayName | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-  $solutions = $solutions | Where-Object { $wanted -contains $_.properties.displayName }
+  $solutions = $solutions | Where-Object {
+    (Test-HasProperty -Object $_.properties -PropertyName "displayName") -and
+    ($wanted -contains $_.properties.displayName)
+  }
 }
 
 if (-not $solutions -or $solutions.Count -eq 0) {
@@ -198,7 +217,10 @@ if (-not $solutions -or $solutions.Count -eq 0) {
 
 Write-Host "Soluciones a reinstalar: $($solutions.Count)" -ForegroundColor Yellow
 $solutions | ForEach-Object {
-  Write-Host " - $($_.properties.displayName)  (version: $($_.properties.version))"
+  $dn = $_.properties.displayName
+  $ver = $_.properties.version
+  $prev = Get-PreviewFlag -Package $_
+  Write-Host " - $dn  (version: $ver, preview: $prev)"
 }
 
 foreach ($pkg in $solutions) {
@@ -218,19 +240,15 @@ foreach ($pkg in $solutions) {
 
   $pkgUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/$packageId?api-version=$ApiVersion"
 
-  # 3) Uninstall (DELETE) [2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/uninstall?view=rest-securityinsights-2025-09-01)
+  # Uninstall
   if ($PSCmdlet.ShouldProcess($displayName, "UNINSTALL $packageId")) {
-    try {
-      Invoke-ArmWithRetry -Method DELETE -Uri $pkgUri | Out-Null
-      Write-Host "    Uninstall OK" -ForegroundColor DarkGreen
-    } catch {
-      throw "Error en Uninstall de [$displayName]. Detalle: $($_.Exception.Message)"
-    }
+    Invoke-ArmWithRetry -Method DELETE -Uri $pkgUri | Out-Null
+    Write-Host "    Uninstall OK" -ForegroundColor DarkGreen
   }
 
   Start-Sleep -Seconds $DelaySecondsBetweenOperations
 
-  # 4) Install (PUT) [3](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/install?view=rest-securityinsights-2025-09-01)
+  # Install
   $installBody = @{
     properties = @{
       contentId        = $contentId
@@ -242,12 +260,8 @@ foreach ($pkg in $solutions) {
   }
 
   if ($PSCmdlet.ShouldProcess($displayName, "INSTALL $packageId")) {
-    try {
-      Invoke-ArmWithRetry -Method PUT -Uri $pkgUri -Body $installBody | Out-Null
-      Write-Host "    Install OK" -ForegroundColor DarkGreen
-    } catch {
-      throw "Error en Install de [$displayName]. Detalle: $($_.Exception.Message)"
-    }
+    Invoke-ArmWithRetry -Method PUT -Uri $pkgUri -Body $installBody | Out-Null
+    Write-Host "    Install OK" -ForegroundColor DarkGreen
   }
 
   Start-Sleep -Seconds $DelaySecondsBetweenOperations
@@ -255,4 +269,3 @@ foreach ($pkg in $solutions) {
 
 Write-Host ""
 Write-Host "Proceso finalizado." -ForegroundColor Cyan
-``
