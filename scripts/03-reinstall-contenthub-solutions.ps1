@@ -1,20 +1,19 @@
 <#
 .SYNOPSIS
-Reinstala soluciones Content Hub (contentPackages) y despliega todos sus "Installed content items"
+Reinstala soluciones del Content Hub (contentPackages) y despliega todos sus "Installed content items"
 mediante deployment del packagedContent (ARM template) en modo Incremental.
 
 .DESCRIPTION
-1) Lista soluciones instaladas (contentPackages)
-2) Uninstall (DELETE)
-3) Install (PUT) incluyendo contentSchemaVersion (evita 400)
-4) Obtiene packagedContent desde catálogo (contentProductPackages con $expand=properties/packagedContent)
-5) Ejecuta un deployment RG (Microsoft.Resources/deployments) mode=Incremental con ese template
-   => así se instalan/recuperan los "Installed content items"
+1) Lista soluciones instaladas (contentPackages) 
+2) Uninstall (DELETE) [4](https://techcommunity.microsoft.com/blog/microsoftsentinelblog/automate-extraction-of-microsoft-sentinel-analytical-rules-from-github-solutions/4411498)
+3) Install (PUT) incluyendo contentSchemaVersion (evita 400) [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)
+4) Obtiene packagedContent desde catálogo (contentProductPackages con $expand=properties/packagedContent) [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[3](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+5) Ejecuta deployment RG (Microsoft.Resources/deployments) mode=Incremental con ese template
+   => materializa TODOS los "Installed content items" (patrón recomendado por toolkits) [2](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
 
 NOTA:
-- Token ARM se obtiene con Azure CLI (robusto con OIDC).
-- Hay casos reportados donde instalar por API no refresca metadata/plantillas hasta desplegar contenido. [1](https://learn.microsoft.com/en-us/azure/templates/microsoft.resources/deployments)
-- El patrón de despliegue incremental con template=packagedContent es el enfoque “correcto”. [2](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
+- Hay casos donde instalar por API no refresca artefactos/metadata hasta desplegar el contenido. [5](https://learn.microsoft.com/en-us/azure/templates/microsoft.resources/deployments)
+- Token ARM se obtiene con Azure CLI (robusto con OIDC en GitHub Actions).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -40,7 +39,7 @@ param(
   [Parameter(Mandatory = $false)]
   [string]$ApiVersion = "2025-09-01",
 
-  # Deployment API para Microsoft.Resources/deployments
+  # API para Microsoft.Resources/deployments
   [Parameter(Mandatory = $false)]
   [string]$DeploymentApiVersion = "2021-04-01",
 
@@ -56,14 +55,16 @@ param(
   [Parameter(Mandatory = $false)]
   [int]$UninstallWaitSeconds = 60,
 
-  # Nuevo: Espera máxima a que termine el deployment del packagedContent
   [Parameter(Mandatory = $false)]
-  [int]$DeploymentWaitSeconds = 600
+  [int]$DeploymentWaitSeconds = 900
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ------------------------
+# Helpers
+# ------------------------
 function Get-ArmToken {
   $t = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
   if (-not $t -or $t.Trim().Length -lt 100) {
@@ -73,12 +74,16 @@ function Get-ArmToken {
 }
 
 function Test-HasProperty {
-  param([Parameter(Mandatory=$true)] $Object, [Parameter(Mandatory=$true)] [string]$PropertyName)
+  param(
+    [Parameter(Mandatory=$true)] $Object,
+    [Parameter(Mandatory=$true)] [string]$PropertyName
+  )
   return $null -ne $Object -and $Object.PSObject.Properties.Name -contains $PropertyName
 }
 
 function Get-PreviewFlag {
   param([Parameter(Mandatory=$true)] $Package)
+
   if (-not (Test-HasProperty $Package "properties")) { return $false }
   if (-not (Test-HasProperty $Package.properties "isPreview")) { return $false }
   try { return [bool]$Package.properties.isPreview } catch { return $false }
@@ -108,7 +113,7 @@ function Invoke-ArmWithRetry {
   )
 
   $headers = @{
-    Authorization = "Bearer $script:ArmToken"
+    Authorization  = "Bearer $script:ArmToken"
     "Content-Type" = "application/json"
   }
 
@@ -117,6 +122,7 @@ function Invoke-ArmWithRetry {
     $attempt++
     try {
       Write-Verbose "$Method $Uri (attempt $attempt/$MaxRetries)" -Verbose
+
       if ($null -ne $Body) {
         $json = $Body | ConvertTo-Json -Depth 80
         return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json
@@ -131,7 +137,7 @@ function Invoke-ArmWithRetry {
         }
       } catch { }
 
-      # 400 => request inválida: mostrar body y no reintentar
+      # 400 => request inválida, no reintentar. Mostrar body.
       if ($statusCode -eq 400) {
         $body = Get-ErrorBodyFromException -Exception $_.Exception
         if ($body) { throw "HTTP 400 en $Method $Uri. Body=$body" }
@@ -154,8 +160,9 @@ function Invoke-ArmWithRetry {
 
 function Get-CatalogProductInfo {
   <#
-    Catálogo: contentProductPackages. Expandible: properties/packagedContent [3](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-    Devolvemos version, contentProductId, contentSchemaVersion y packagedContent (ARM template).
+    Catálogo: contentProductPackages.
+    Expandible: properties/packagedContent [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[3](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+    Devuelve version, contentProductId, contentSchemaVersion y packagedContent.
   #>
   param(
     [Parameter(Mandatory=$true)][string]$ContentId,
@@ -166,7 +173,6 @@ function Get-CatalogProductInfo {
   $filter = "properties/contentId eq '$ContentId' and properties/contentKind eq '$ContentKind'"
   $encodedFilter = [System.Uri]::EscapeDataString($filter)
 
-  # Importante: expand packagedContent para poder desplegar todos los items
   $catalogUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion&`$filter=$encodedFilter&`$expand=properties/packagedContent&`$top=50"
   Write-Verbose "GET catalog: $catalogUri" -Verbose
 
@@ -181,28 +187,28 @@ function Get-CatalogProductInfo {
     $match = $candidates | Where-Object { $_.properties.version -eq $PreferredVersion } | Select-Object -First 1
     if ($match) {
       return @{
-        version = $match.properties.version
-        contentProductId = $match.properties.contentProductId
-        contentSchemaVersion = $match.properties.contentSchemaVersion
-        packagedContent = $match.properties.packagedContent
-        displayName = $match.properties.displayName
+        version             = $match.properties.version
+        contentProductId    = $match.properties.contentProductId
+        contentSchemaVersion= $match.properties.contentSchemaVersion
+        packagedContent     = $match.properties.packagedContent
+        displayName         = $match.properties.displayName
       }
     }
     Write-Warning "PreferredVersion [$PreferredVersion] no aparece en catálogo. Usando latest."
   }
 
-  # Latest semver
+  # latest semver
   $sorted = $candidates | Sort-Object -Property @{
     Expression = { try { [version]$_.properties.version } catch { [version]"0.0.0" } }
   } -Descending
   $latest = $sorted | Select-Object -First 1
 
   return @{
-    version = $latest.properties.version
-    contentProductId = $latest.properties.contentProductId
-    contentSchemaVersion = $latest.properties.contentSchemaVersion
-    packagedContent = $latest.properties.packagedContent
-    displayName = $latest.properties.displayName
+    version             = $latest.properties.version
+    contentProductId    = $latest.properties.contentProductId
+    contentSchemaVersion= $latest.properties.contentSchemaVersion
+    packagedContent     = $latest.properties.packagedContent
+    displayName         = $latest.properties.displayName
   }
 }
 
@@ -229,19 +235,19 @@ function Wait-Until-Uninstalled {
 function Start-PackagedContentDeployment {
   <#
     Despliega packagedContent (ARM template) con Microsoft.Resources/deployments mode=Incremental
-    => Esto es lo que “materializa” los Installed content items. [2](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
+    => materializa Installed content items. [2](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
   #>
   param(
     [Parameter(Mandatory=$true)][string]$SolutionDisplayName,
     [Parameter(Mandatory=$true)]$PackagedContentTemplate
   )
 
-  # Nombre de deployment con límite razonable
   $safeName = $SolutionDisplayName -replace '[^a-zA-Z0-9\-]', '-'
   $deploymentName = "ContentHub-Reinstall-$safeName"
   if ($deploymentName.Length -gt 62) { $deploymentName = $deploymentName.Substring(0, 62) }
 
-  $deployUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Resources/deployments/$deploymentName?api-version=$DeploymentApiVersion"
+  # ✅ FIX: usar ${deploymentName} para que PowerShell no intente $deploymentName?api como variable
+  $deployUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Resources/deployments/${deploymentName}?api-version=$DeploymentApiVersion"
 
   $deployBody = @{
     properties = @{
@@ -257,7 +263,6 @@ function Start-PackagedContentDeployment {
   Write-Host "    Deploy packagedContent (Incremental) => $deploymentName" -ForegroundColor Cyan
   Invoke-ArmWithRetry -Method PUT -Uri $deployUri -Body $deployBody | Out-Null
 
-  # Espera a que termine
   $deadline = (Get-Date).AddSeconds($DeploymentWaitSeconds)
   while ((Get-Date) -lt $deadline) {
     $get = Invoke-ArmWithRetry -Method GET -Uri $deployUri
@@ -266,7 +271,7 @@ function Start-PackagedContentDeployment {
 
     if ($state -eq "Succeeded") { return }
     if ($state -in @("Failed","Canceled")) {
-      $details = $get.properties.error | ConvertTo-Json -Depth 20
+      $details = $get.properties.error | ConvertTo-Json -Depth 30
       throw "Deployment $deploymentName terminó en estado $state. Error: $details"
     }
     Start-Sleep -Seconds 10
@@ -292,7 +297,7 @@ if ($SolutionDisplayName.Count -gt 0) {
 
 $script:ArmToken = Get-ArmToken
 
-# List installed contentPackages 
+# List installed solutions (contentPackages) 
 $listUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages?api-version=$ApiVersion"
 Write-Verbose "GET $listUri" -Verbose
 $installed = Invoke-ArmWithRetry -Method GET -Uri $listUri
@@ -344,6 +349,7 @@ foreach ($pkg in $solutions) {
   $preferred = $null
   if ($UseInstalledVersion) { $preferred = $installedVer }
 
+  # Resolver datos correctos desde catálogo (incluye packagedContent) [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[3](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
   $catalogInfo = Get-CatalogProductInfo -ContentId $contentId -ContentKind $contentKind -PreferredVersion $preferred
 
   $targetVersion = $catalogInfo.version
@@ -353,7 +359,7 @@ foreach ($pkg in $solutions) {
 
   $packagedContent = $catalogInfo.packagedContent
   if (-not $packagedContent) {
-    throw "No se pudo obtener packagedContent del catálogo para $displayName (¿falta expand?)."
+    throw "No se pudo obtener packagedContent del catálogo para $displayName."
   }
 
   Write-Host "    targetVersion       : $targetVersion"
@@ -362,7 +368,7 @@ foreach ($pkg in $solutions) {
 
   $pkgUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
-  # Uninstall
+  # Uninstall [4](https://techcommunity.microsoft.com/blog/microsoftsentinelblog/automate-extraction-of-microsoft-sentinel-analytical-rules-from-github-solutions/4411498)
   if ($PSCmdlet.ShouldProcess($displayName, "UNINSTALL $packageId")) {
     Invoke-ArmWithRetry -Method DELETE -Uri $pkgUri | Out-Null
     Write-Host "    Uninstall OK" -ForegroundColor DarkGreen
@@ -371,7 +377,7 @@ foreach ($pkg in $solutions) {
   Wait-Until-Uninstalled -PackageId $packageId
   Start-Sleep -Seconds $DelaySecondsBetweenOperations
 
-  # Install (incluye schemaVersion)
+  # Install (incluye contentSchemaVersion) [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)
   $installBody = @{
     properties = @{
       contentId            = $contentId
@@ -390,7 +396,7 @@ foreach ($pkg in $solutions) {
 
   Start-Sleep -Seconds $DelaySecondsBetweenOperations
 
-  # ✅ Paso clave: desplegar packagedContent para instalar TODOS los items
+  # ✅ Paso clave: Deploy packagedContent para instalar todos los content items (Incremental) [2](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
   if ($PSCmdlet.ShouldProcess($displayName, "DEPLOY packagedContent (Installed content items)")) {
     Start-PackagedContentDeployment -SolutionDisplayName $displayName -PackagedContentTemplate $packagedContent
     Write-Host "    PackagedContent deployment OK" -ForegroundColor DarkGreen
