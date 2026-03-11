@@ -3,18 +3,15 @@
 Instala soluciones de Microsoft Sentinel Content Hub desde un CSV de displayName.
 
 .DESCRIPTION
-- Parse SolutionsCsv (separado por comas).
-- Para cada displayName:
-  1) Busca en el catálogo (contentProductPackages) usando $search y filtra contentKind=Solution.
-     (Soporta $expand=properties/packagedContent) [2](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-  2) Selecciona la versión más reciente (semver).
-  3) Instala/actualiza el contentPackage vía PUT incluyendo contentSchemaVersion (evita 400). 
-  4) Despliega packagedContent vía Microsoft.Resources/deployments (Incremental) para materializar
-     Installed content items (reglas, workbooks, etc.). [1](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)[2](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)
+Para cada displayName:
+1) Busca en catálogo (contentProductPackages) usando $search y filtra contentKind=Solution.
+   Devuelve version/contentId/contentProductId/contentSchemaVersion y packagedContent (expand). [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+2) Instala el paquete en el workspace vía contentPackages/{packageId} (PUT) usando packageId=contentId. 
+3) Despliega packagedContent vía Microsoft.Resources/deployments mode=Incremental para materializar Installed content items. [3](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
 
-REQUISITOS:
-- Azure Login OIDC ya ejecutado en el workflow.
-- Permisos adecuados (p.ej. Microsoft Sentinel Contributor). [3](https://github.com/noodlemctwoodle/Sentinel-As-Code)
+Requisitos:
+- azure/login (OIDC) ya ejecutado en el workflow.
+- Permisos adecuados (p.ej. Microsoft Sentinel Contributor). [4](https://github.com/noodlemctwoodle/Sentinel-As-Code)
 #>
 
 [CmdletBinding()]
@@ -31,7 +28,6 @@ param(
   [Parameter(Mandatory = $false)]
   [string]$ApiVersion = "2025-09-01",
 
-  # API para deployments (Microsoft.Resources/deployments)
   [Parameter(Mandatory = $false)]
   [string]$DeploymentApiVersion = "2021-04-01",
 
@@ -51,21 +47,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ------------------------
+# Utilidades
+# ------------------------
 function Get-SubscriptionIdFromContext {
   try {
     $ctx = Get-AzContext
     if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id) { return $ctx.Subscription.Id }
   } catch {}
-  # fallback
+
   try {
     $sub = az account show --query id -o tsv
     if ($sub) { return $sub }
   } catch {}
-  throw "No se pudo determinar SubscriptionId. Asegúrate de estar autenticado (azure/login) y con contexto."
+
+  throw "No se pudo determinar SubscriptionId. Revisa azure/login / contexto."
 }
 
 function Get-ArmToken {
-  # Token ARM con Azure CLI (robusto en GH Actions OIDC)
   $t = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
   if (-not $t -or $t.Trim().Length -lt 100) {
     throw "Token ARM inválido o vacío. Revisa azure/login y permisos."
@@ -120,7 +119,7 @@ function Invoke-ArmWithRetry {
         }
       } catch { }
 
-      # 400: no reintentar; mostrar body
+      # 400: no reintentar, devolver body
       if ($statusCode -eq 400) {
         $body = Get-ErrorBodyFromException -Exception $_.Exception
         if ($body) { throw "HTTP 400 en $Method $Uri. Body=$body" }
@@ -143,31 +142,24 @@ function Invoke-ArmWithRetry {
 
 function Parse-SolutionsCsv {
   param([Parameter(Mandatory=$true)][string]$Csv)
-
-  # Soportamos coma y también pipes/newlines por si llega formateado
   $raw = $Csv -replace '\|', ',' -replace "`r", "," -replace "`n", ","
-  $list = $raw.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-  return $list
+  $raw.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
-function Get-CatalogSolutionMatch {
+# ------------------------
+# Catálogo (búsqueda y match estricto)
+# ------------------------
+function Get-CatalogCandidates {
   <#
-    Busca en catálogo por $search y devuelve el "mejor match" exacto por displayName,
-    y si no hay exacto, el primero que contenga.
-    Usa contentProductPackages (catálogo) [2](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+    Catálogo: contentProductPackages, soporta $search y $expand=properties/packagedContent. [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
   #>
-  param(
-    [Parameter(Mandatory=$true)][string]$DisplayName
-  )
+  param([Parameter(Mandatory=$true)][string]$DisplayName)
 
   $search = [System.Uri]::EscapeDataString($DisplayName)
   $uri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion&`$search=$search&`$expand=properties/packagedContent&`$top=50"
 
   $resp = Invoke-ArmWithRetry -Method GET -Uri $uri
-
-  if (-not $resp.value) {
-    throw "Catálogo sin resultados para '$DisplayName'."
-  }
+  if (-not $resp.value) { return @() }
 
   $candidates = $resp.value | Where-Object { $_.properties.contentKind -eq "Solution" }
 
@@ -175,58 +167,83 @@ function Get-CatalogSolutionMatch {
     $candidates = $candidates | Where-Object { -not $_.properties.isPreview }
   }
 
-  if (-not $candidates -or $candidates.Count -eq 0) {
-    throw "No hay candidatos Solution en catálogo para '$DisplayName' (quizá Preview o nombre distinto)."
+  return $candidates
+}
+
+function Select-BestCatalogMatch {
+  <#
+    Match estricto:
+    1) Exacto por displayName (case-insensitive)
+    2) Si no, match por "contains" (case-insensitive)
+    3) Si sigue sin haber nada, FALLA (no elige random).
+  #>
+  param(
+    [Parameter(Mandatory=$true)][string]$RequestedDisplayName,
+    [Parameter(Mandatory=$true)]$Candidates
+  )
+
+  if (-not $Candidates -or $Candidates.Count -eq 0) {
+    throw "Catálogo sin candidatos Solution para '$RequestedDisplayName'."
   }
 
-  # 1) match exacto case-insensitive
-  $dn = $DisplayName.Trim().ToLower()
-  $exact = $candidates | Where-Object { $_.properties.displayName -and $_.properties.displayName.Trim().ToLower() -eq $dn }
+  $req = $RequestedDisplayName.Trim().ToLower()
 
+  $exact = $Candidates | Where-Object {
+    $_.properties.displayName -and $_.properties.displayName.Trim().ToLower() -eq $req
+  }
+
+  $pool = $null
   if ($exact -and $exact.Count -gt 0) {
-    $candidates = $exact
+    $pool = $exact
   } else {
-    # 2) match contains
-    $contains = $candidates | Where-Object { $_.properties.displayName -and $_.properties.displayName.Trim().ToLower().Contains($dn) }
+    $contains = $Candidates | Where-Object {
+      $_.properties.displayName -and $_.properties.displayName.Trim().ToLower().Contains($req)
+    }
     if ($contains -and $contains.Count -gt 0) {
-      $candidates = $contains
+      $pool = $contains
     }
   }
 
-  # Elegir versión más alta (semver)
-  $sorted = $candidates | Sort-Object -Property @{
+  if (-not $pool -or $pool.Count -eq 0) {
+    $names = ($Candidates | Select-Object -ExpandProperty properties |
+      Select-Object -ExpandProperty displayName | Sort-Object -Unique) -join " | "
+    throw "No hay match para '$RequestedDisplayName'. Candidatos devueltos por catálogo: $names"
+  }
+
+  # Elegir la mayor versión (semver)
+  $sorted = $pool | Sort-Object -Property @{
     Expression = { try { [version]$_.properties.version } catch { [version]"0.0.0" } }
   } -Descending
 
   return ($sorted | Select-Object -First 1)
 }
 
-function Install-ContentPackage {
+# ------------------------
+# Instalación (contentPackages)
+# ------------------------
+function Install-ContentPackageFromCatalogItem {
   <#
-    Instala/actualiza paquete vía contentPackages/{packageId} PUT 
+    Install endpoint: contentPackages/{packageId} (PUT). 
+    IMPORTANTE: packageId = contentId (no contentProductId)
   #>
-  param(
-    [Parameter(Mandatory=$true)]$CatalogItem
-  )
+  param([Parameter(Mandatory=$true)]$CatalogItem)
 
-  $contentId = $CatalogItem.properties.contentId
-  $contentKind = $CatalogItem.properties.contentKind
+  $contentId        = $CatalogItem.properties.contentId
+  $contentKind      = $CatalogItem.properties.contentKind
   $contentProductId = $CatalogItem.properties.contentProductId
-  $displayName = $CatalogItem.properties.displayName
-  $version = $CatalogItem.properties.version
-
-  # contentSchemaVersion es clave para evitar 400 (reportado por la comunidad) 
-  $schemaVersion = $CatalogItem.properties.contentSchemaVersion
+  $displayName      = $CatalogItem.properties.displayName
+  $version          = $CatalogItem.properties.version
+  $schemaVersion    = $CatalogItem.properties.contentSchemaVersion
   if (-not $schemaVersion) { $schemaVersion = "2.0" }
 
-  # packageId normalmente coincide con el "name" del item del catálogo (ej: ...solution-syslog)
-  $packageId = $CatalogItem.name
-  if (-not $packageId) { $packageId = $contentId }
+  # ✅ CLAVE: packageId en la URL debe ser el ID del paquete (usamos contentId)
+  $packageId = $contentId
 
   Write-Host "==> Instalando/actualizando: $displayName"
-  Write-Host "    packageId          : $packageId"
-  Write-Host "    contentId          : $contentId"
-  Write-Host "    version            : $version"
+  Write-Host "    packageId           : $packageId"
+  Write-Host "    contentId           : $contentId"
+  Write-Host "    contentProductId    : $contentProductId"
+  Write-Host "    version             : $version"
   Write-Host "    contentSchemaVersion: $schemaVersion"
 
   $uri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
@@ -243,29 +260,30 @@ function Install-ContentPackage {
   }
 
   Invoke-ArmWithRetry -Method PUT -Uri $uri -Body $body | Out-Null
-  Write-Host "    OK: Package instalado/actualizado"
+  Write-Host "    OK: contentPackage instalado/actualizado"
 }
 
-function Deploy-PackagedContent {
+# ------------------------
+# Deployment (packagedContent)
+# ------------------------
+function Deploy-PackagedContentFromCatalogItem {
   <#
-    Despliega properties.packagedContent como ARM template (Microsoft.Resources/deployments) mode=Incremental
-    para instalar todos los Installed content items. [1](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)[2](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)
+    contentProductPackages puede expandir packagedContent para desplegar el ARM template. [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+    Este deployment incremental materializa Installed content items. [3](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
   #>
-  param(
-    [Parameter(Mandatory=$true)]$CatalogItem
-  )
+  param([Parameter(Mandatory=$true)]$CatalogItem)
 
   $displayName = $CatalogItem.properties.displayName
   $template = $CatalogItem.properties.packagedContent
   if (-not $template) {
-    throw "No hay packagedContent en catálogo para '$displayName'. Revisa que el $expand esté aplicado."
+    throw "No hay packagedContent en catálogo para '$displayName'."
   }
 
   $safeName = ($displayName -replace '[^a-zA-Z0-9\-]', '-')
   $deploymentName = "ContentHub-Install-$safeName"
   if ($deploymentName.Length -gt 62) { $deploymentName = $deploymentName.Substring(0, 62) }
 
-  # ✅ IMPORTANTE: usar ${deploymentName} para evitar el bug $deploymentName?api
+  # ✅ FIX ${deploymentName}?api-version
   $deployUri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Resources/deployments/${deploymentName}?api-version=$DeploymentApiVersion"
 
   $deployBody = @{
@@ -282,7 +300,6 @@ function Deploy-PackagedContent {
   Write-Host "    ==> Deploy packagedContent (Incremental): $deploymentName"
   Invoke-ArmWithRetry -Method PUT -Uri $deployUri -Body $deployBody | Out-Null
 
-  # Esperar fin del deployment
   $deadline = (Get-Date).AddSeconds($DeploymentWaitSeconds)
   while ((Get-Date) -lt $deadline) {
     $get = Invoke-ArmWithRetry -Method GET -Uri $deployUri
@@ -297,6 +314,7 @@ function Deploy-PackagedContent {
       $details = $get.properties.error | ConvertTo-Json -Depth 30
       throw "Deployment $deploymentName terminó en estado $state. Error: $details"
     }
+
     Start-Sleep -Seconds 10
   }
 
@@ -312,36 +330,26 @@ $script:SubscriptionId = Get-SubscriptionIdFromContext
 $script:ArmToken = Get-ArmToken
 
 $solutions = Parse-SolutionsCsv -Csv $SolutionsCsv
-if (-not $solutions -or $solutions.Count -eq 0) {
-  throw "SolutionsCsv está vacío o no se pudo parsear."
-}
-
 Write-Host "Total soluciones a procesar: $($solutions.Count)"
-if (-not $IncludePreview) {
-  Write-Host "Preview: EXCLUIDO"
-} else {
-  Write-Host "Preview: INCLUIDO"
-}
+Write-Host ("Preview: " + ($(if ($IncludePreview) { "INCLUIDO" } else { "EXCLUIDO" })))
 
 foreach ($sol in $solutions) {
-  try {
-    Write-Host ""
-    Write-Host "============================="
-    Write-Host "Procesando: $sol"
-    Write-Host "============================="
+  Write-Host ""
+  Write-Host "============================="
+  Write-Host "Procesando: $sol"
+  Write-Host "============================="
 
-    $catalogItem = Get-CatalogSolutionMatch -DisplayName $sol
-    Write-Host "Catálogo match: $($catalogItem.properties.displayName) (version: $($catalogItem.properties.version))"
+  # 1) catálogo
+  $candidates = Get-CatalogCandidates -DisplayName $sol
+  $match = Select-BestCatalogMatch -RequestedDisplayName $sol -Candidates $candidates
 
-    Install-ContentPackage -CatalogItem $catalogItem
+  Write-Host "Catálogo match: $($match.properties.displayName) (version: $($match.properties.version))"
 
-    # Paso clave: desplegar contenido (Installed content items)
-    Deploy-PackagedContent -CatalogItem $catalogItem
+  # 2) install package (contentPackages)
+  Install-ContentPackageFromCatalogItem -CatalogItem $match
 
-  } catch {
-    Write-Error "ERROR en solución '$sol': $($_.Exception.Message)"
-    throw
-  }
+  # 3) deploy packagedContent (Installed content items)
+  Deploy-PackagedContentFromCatalogItem -CatalogItem $match
 }
 
 Write-Host ""
