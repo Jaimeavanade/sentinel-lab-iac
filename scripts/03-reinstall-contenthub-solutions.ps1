@@ -58,8 +58,6 @@ param(
   [Parameter(Mandatory = $false)]
   [switch]$IncludePreview,
 
-  # Por defecto usamos latest del catálogo (recomendado).
-  # Si pones -UseInstalledVersion, intentará reinstalar la versión instalada (si aún existe en catálogo).
   [Parameter(Mandatory = $false)]
   [switch]$UseInstalledVersion,
 
@@ -75,7 +73,6 @@ param(
   [Parameter(Mandatory = $false)]
   [int]$RetryDelaySeconds = 5,
 
-  # Espera tras Uninstall hasta que el recurso deje de existir (o cambie estado)
   [Parameter(Mandatory = $false)]
   [int]$UninstallWaitSeconds = 60
 )
@@ -84,40 +81,25 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 function Get-ArmToken {
-  try {
-    $t = az account get-access-token `
-      --resource https://management.azure.com/ `
-      --query accessToken -o tsv
-
-    if (-not $t -or $t.Trim().Length -lt 100) {
-      throw "Token ARM vacío/no válido devuelto por Azure CLI."
-    }
-    return $t
-  } catch {
-    throw "No se pudo obtener token ARM vía Azure CLI. Detalle: $($_.Exception.Message)"
-  }
+  $t = az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv
+  if (-not $t -or $t.Trim().Length -lt 100) { throw "Token ARM inválido." }
+  return $t
 }
 
 function Test-HasProperty {
-  param(
-    [Parameter(Mandatory=$true)] $Object,
-    [Parameter(Mandatory=$true)] [string]$PropertyName
-  )
+  param([Parameter(Mandatory=$true)] $Object, [Parameter(Mandatory=$true)] [string]$PropertyName)
   return $null -ne $Object -and $Object.PSObject.Properties.Name -contains $PropertyName
 }
 
 function Get-PreviewFlag {
   param([Parameter(Mandatory=$true)] $Package)
-
-  if (-not (Test-HasProperty -Object $Package -PropertyName "properties")) { return $false }
-  if (-not (Test-HasProperty -Object $Package.properties -PropertyName "isPreview")) { return $false }
-
+  if (-not (Test-HasProperty $Package "properties")) { return $false }
+  if (-not (Test-HasProperty $Package.properties "isPreview")) { return $false }
   try { return [bool]$Package.properties.isPreview } catch { return $false }
 }
 
 function Get-ErrorBodyFromException {
   param([Parameter(Mandatory=$true)] $Exception)
-
   try {
     if ($Exception.Response -and $Exception.Response.GetResponseStream) {
       $stream = $Exception.Response.GetResponseStream()
@@ -156,34 +138,25 @@ function Invoke-ArmWithRetry {
         return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers
       }
     } catch {
-      $msg = $_.Exception.Message
       $statusCode = $null
-
       try {
         if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
           $statusCode = [int]$_.Exception.Response.StatusCode
         }
       } catch { }
 
-      # Para 400, NO reintentar: es request inválida. Mejor mostrar body.
+      # Para 400, mostrar body y no reintentar
       if ($statusCode -eq 400) {
         $body = Get-ErrorBodyFromException -Exception $_.Exception
-        if ($body) {
-          throw "Fallo en $Method $Uri. StatusCode=400. Body=$body"
-        }
-        throw "Fallo en $Method $Uri. StatusCode=400. Error=$msg"
+        if ($body) { throw "Fallo 400 en $Method $Uri. Body=$body" }
+        throw "Fallo 400 en $Method $Uri. Sin body."
       }
 
-      $isTransient = $false
-      if ($statusCode -eq 429) { $isTransient = $true }
-      if ($statusCode -ge 500 -and $statusCode -le 599) { $isTransient = $true }
-
+      $isTransient = ($statusCode -eq 429) -or ($statusCode -ge 500 -and $statusCode -le 599)
       if ($attempt -ge $MaxRetries -or -not $isTransient) {
         $body = Get-ErrorBodyFromException -Exception $_.Exception
-        if ($body) {
-          throw "Fallo en $Method $Uri. StatusCode=$statusCode. Error=$msg. Body=$body"
-        }
-        throw "Fallo en $Method $Uri. StatusCode=$statusCode. Error=$msg"
+        if ($body) { throw "Fallo en $Method $Uri. StatusCode=$statusCode. Body=$body" }
+        throw "Fallo en $Method $Uri. StatusCode=$statusCode."
       }
 
       $sleep = $RetryDelaySeconds * $attempt
@@ -195,8 +168,7 @@ function Invoke-ArmWithRetry {
 
 function Get-CatalogProductInfo {
   <#
-    Devuelve info de catálogo (latest o versión instalada si se solicita).
-    Usa endpoint contentProductPackages (catálogo). [2](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
+    Usa contentProductPackages (catálogo) que expone version, contentProductId y contentSchemaVersion. [3](https://techcommunity.microsoft.com/blog/iis-support-blog/how-to-troubleshoot-http-400-errors/347601)[4](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
   #>
   param(
     [Parameter(Mandatory=$true)][string]$ContentId,
@@ -204,8 +176,6 @@ function Get-CatalogProductInfo {
     [Parameter(Mandatory=$false)][string]$PreferredVersion
   )
 
-  # OData filter: properties/contentId eq '...' and properties/contentKind eq 'Solution'
-  # Nota: el endpoint soporta $filter/$orderby/$top. [2](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
   $filter = "properties/contentId eq '$ContentId' and properties/contentKind eq '$ContentKind'"
   $encodedFilter = [System.Uri]::EscapeDataString($filter)
 
@@ -217,14 +187,10 @@ function Get-CatalogProductInfo {
     throw "No se encontró el paquete en catálogo para contentId=$ContentId / kind=$ContentKind"
   }
 
-  # Si se pide una versión concreta (installed), intentamos encontrarla; si no, cogemos latest (mayor).
   $candidates = $catalog.value
 
-  # Elegir por PreferredVersion si existe en catálogo
   if ($PreferredVersion) {
     $match = $candidates | Where-Object {
-      (Test-HasProperty -Object $_ -PropertyName "properties") -and
-      (Test-HasProperty -Object $_.properties -PropertyName "version") -and
       $_.properties.version -eq $PreferredVersion
     } | Select-Object -First 1
 
@@ -232,6 +198,7 @@ function Get-CatalogProductInfo {
       return @{
         version = $match.properties.version
         contentProductId = $match.properties.contentProductId
+        contentSchemaVersion = $match.properties.contentSchemaVersion
         displayName = $match.properties.displayName
       }
     }
@@ -239,25 +206,22 @@ function Get-CatalogProductInfo {
     Write-Warning "La versión preferida [$PreferredVersion] no aparece en catálogo. Se usará latest."
   }
 
-  # Orden semver: intentamos [version] (si falla, string)
   $sorted = $candidates | Sort-Object -Property @{
-    Expression = {
-      try { [version]$_.properties.version } catch { [version]"0.0.0" }
-    }
+    Expression = { try { [version]$_.properties.version } catch { [version]"0.0.0" } }
   } -Descending
 
   $latest = $sorted | Select-Object -First 1
+
   return @{
     version = $latest.properties.version
     contentProductId = $latest.properties.contentProductId
+    contentSchemaVersion = $latest.properties.contentSchemaVersion
     displayName = $latest.properties.displayName
   }
 }
 
 function Wait-Until-Uninstalled {
-  param(
-    [Parameter(Mandatory=$true)][string]$PackageId
-  )
+  param([Parameter(Mandatory=$true)][string]$PackageId)
 
   $pkgGetUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${PackageId}?api-version=$ApiVersion"
 
@@ -268,12 +232,10 @@ function Wait-Until-Uninstalled {
       Write-Verbose "Aún aparece instalado $PackageId, esperando..." -Verbose
       Start-Sleep -Seconds 5
     } catch {
-      # Si devuelve 404 o similar, ya no está.
-      Write-Verbose "Confirmado: $PackageId ya no está instalado (o no se puede obtener). Continuando..." -Verbose
+      Write-Verbose "Confirmado: $PackageId ya no está instalado. Continuando..." -Verbose
       return
     }
   }
-
   Write-Warning "Timeout esperando a que se complete el uninstall de $PackageId. Continuamos igualmente."
 }
 
@@ -294,7 +256,7 @@ if ($SolutionDisplayName.Count -gt 0) {
 
 $script:ArmToken = Get-ArmToken
 
-# List installed contentPackages [3](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages/list?view=rest-securityinsights-2025-09-01)
+# List installed packages [5](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages/list?view=rest-securityinsights-2025-09-01)
 $listUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages?api-version=$ApiVersion"
 Write-Verbose "GET $listUri" -Verbose
 $installed = Invoke-ArmWithRetry -Method GET -Uri $listUri
@@ -304,12 +266,7 @@ if (-not $installed.value) {
   return
 }
 
-# Filter Solutions
-$solutions = $installed.value | Where-Object {
-  (Test-HasProperty -Object $_ -PropertyName "properties") -and
-  (Test-HasProperty -Object $_.properties -PropertyName "contentKind") -and
-  $_.properties.contentKind -eq "Solution"
-}
+$solutions = $installed.value | Where-Object { $_.properties.contentKind -eq "Solution" }
 
 if (-not $IncludePreview) {
   $solutions = $solutions | Where-Object { -not (Get-PreviewFlag -Package $_) }
@@ -317,23 +274,17 @@ if (-not $IncludePreview) {
 
 if ($SolutionDisplayName.Count -gt 0) {
   $wanted = $SolutionDisplayName | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-  $solutions = $solutions | Where-Object {
-    (Test-HasProperty -Object $_.properties -PropertyName "displayName") -and
-    ($wanted -contains $_.properties.displayName)
-  }
+  $solutions = $solutions | Where-Object { $wanted -contains $_.properties.displayName }
 }
 
 if (-not $solutions -or $solutions.Count -eq 0) {
-  Write-Warning "No hay soluciones que cumplan los filtros (o no hay soluciones instaladas)."
+  Write-Warning "No hay soluciones que cumplan los filtros."
   return
 }
 
 Write-Host "Soluciones a reinstalar: $($solutions.Count)" -ForegroundColor Yellow
 $solutions | ForEach-Object {
-  $dn = $_.properties.displayName
-  $ver = $_.properties.version
-  $prev = Get-PreviewFlag -Package $_
-  Write-Host " - $dn  (installed version: $ver, preview: $prev)"
+  Write-Host " - $($_.properties.displayName)  (installed version: $($_.properties.version), preview: $(Get-PreviewFlag -Package $_))"
 }
 
 foreach ($pkg in $solutions) {
@@ -350,7 +301,6 @@ foreach ($pkg in $solutions) {
   Write-Host "    contentId : $contentId"
   Write-Host "    installed : $installedVer"
 
-  # Siempre resolvemos info desde catálogo para evitar 400 (version debe ser latest) [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/install?view=rest-securityinsights-2025-09-01)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
   $preferred = $null
   if ($UseInstalledVersion) { $preferred = $installedVer }
 
@@ -358,39 +308,4 @@ foreach ($pkg in $solutions) {
   $targetVersion = $catalogInfo.version
   $targetProductId = $catalogInfo.contentProductId
 
-  Write-Host "    targetVersion    : $targetVersion"
-  Write-Host "    targetProductId  : $targetProductId"
 
-  $pkgUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
-
-  # Uninstall [4](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/uninstall?view=rest-securityinsights-2025-09-01)
-  if ($PSCmdlet.ShouldProcess($displayName, "UNINSTALL $packageId")) {
-    Invoke-ArmWithRetry -Method DELETE -Uri $pkgUri | Out-Null
-    Write-Host "    Uninstall OK" -ForegroundColor DarkGreen
-  }
-
-  # Esperar a que se refleje el uninstall para evitar estados intermedios
-  Wait-Until-Uninstalled -PackageId $packageId
-  Start-Sleep -Seconds $DelaySecondsBetweenOperations
-
-  # Install (version debe ser latest) [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-package/install?view=rest-securityinsights-2025-09-01)
-  $installBody = @{
-    properties = @{
-      contentId        = $contentId
-      contentKind      = $contentKind
-      contentProductId = $targetProductId
-      displayName      = $displayName
-      version          = $targetVersion
-    }
-  }
-
-  if ($PSCmdlet.ShouldProcess($displayName, "INSTALL $packageId")) {
-    Invoke-ArmWithRetry -Method PUT -Uri $pkgUri -Body $installBody | Out-Null
-    Write-Host "    Install OK" -ForegroundColor DarkGreen
-  }
-
-  Start-Sleep -Seconds $DelaySecondsBetweenOperations
-}
-
-Write-Host ""
-Write-Host "Proceso finalizado." -ForegroundColor Cyan
