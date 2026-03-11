@@ -102,45 +102,55 @@ jobs:
 
 
   list_catalog:
-    name: Export Content Hub Solutions Catalog (CSV)
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'list-catalog' }}
+  name: Export Content Hub Solutions Catalog (CSV)
+  runs-on: ubuntu-latest
+  if: ${{ github.event.inputs.action == 'list-catalog' }}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          audience: api://AzureADTokenExchange
-          enable-AzPSSession: true
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        audience: api://AzureADTokenExchange
+        enable-AzPSSession: true
 
-      - name: Export catalog to CSV
-        uses: azure/powershell@v2
-        with:
-          azPSVersion: "latest"
-          errorActionPreference: "Stop"
-          inlineScript: |
-            $ErrorActionPreference = "Stop"
-            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
+    - name: Export catalog to CSV
+      uses: azure/powershell@v2
+      with:
+        azPSVersion: "latest"
+        errorActionPreference: "Stop"
+        inlineScript: |
+          $ErrorActionPreference = "Stop"
+          Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
-            $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
-            $search = "${{ github.event.inputs.catalogSearch }}"
+          $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
+          $search = "${{ github.event.inputs.catalogSearch }}"
 
-            & "${{ github.workspace }}/scripts/00-export-contenthub-catalog.ps1" `
-              -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
-              -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
-              -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
-              -IncludePreview:($includePreview) `
-              -Search $search `
-              -OutCsv "contenthub-solutions-catalog.csv"
+          & "${{ github.workspace }}/scripts/00-export-contenthub-catalog.ps1" `
+            -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
+            -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
+            -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
+            -IncludePreview:($includePreview) `
+            -Search $search `
+            -OutCsv "${{ github.workspace }}/contenthub-solutions-catalog.csv"
 
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: contenthub-solutions-catalog
-          path: contenthub-solutions-catalog.csv
+    - name: Debug - list files
+      run: |
+        echo "PWD:"
+        pwd
+        echo "Workspace listing:"
+        ls -la "${{ github.workspace }}"
+        echo "CSV check:"
+        ls -la "${{ github.workspace }}/contenthub-solutions-catalog.csv" || true
+
+    - name: Upload CSV artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: contenthub-solutions-catalog
+        path: ${{ github.workspace }}/contenthub-solutions-catalog.csv
+        if-no-files-found: error
