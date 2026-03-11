@@ -9,8 +9,8 @@ Exporta el catálogo completo de Microsoft Sentinel Content Hub (Solutions) a CS
 - Exporta a CSV: displayName, contentId, contentProductId, version, isPreview, installedVersion.
 
 Notas:
-- contentProductPackages soporta query options ($filter/$orderby/$top/$search/$skipToken) y paginación. [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
-- $top debe ser entero >= 0 (OData), pero este servicio puede rechazar valores altos; usamos 50. [2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-odata/505b6322-c57f-4c37-94ef-daf8b6e2abd3)
+- contentProductPackages soporta query options y paginación por nextLink. [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+- Usamos $top=50 para evitar errores de query OData en este endpoint; $top es un entero OData. [2](https://apitracker.io/a/azure-senitel)
 #>
 
 [CmdletBinding()]
@@ -33,7 +33,6 @@ param(
   [Parameter(Mandatory = $false)]
   [switch]$IncludePreview,
 
-  # Opcional: filtra por término de búsqueda (si vacío, trae todo)
   [Parameter(Mandatory = $false)]
   [string]$Search = ""
 )
@@ -60,7 +59,6 @@ function Invoke-ArmGet {
   try {
     return Invoke-RestMethod -Method GET -Uri $Uri -Headers $headers
   } catch {
-    # Si ARM devuelve body con error, lo mostramos (ayuda a debug)
     $body = $null
     try {
       if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
@@ -68,10 +66,70 @@ function Invoke-ArmGet {
         $body = $reader.ReadToEnd()
       }
     } catch {}
-    if ($body) {
-      throw "Fallo GET. Uri=$Uri. Body=$body"
-    }
+    if ($body) { throw "Fallo GET. Uri=$Uri. Body=$body" }
     throw "Fallo GET. Uri=$Uri. Error=$($_.Exception.Message)"
   }
 }
 
+$script:ArmToken = Get-ArmToken
+
+# Catálogo: contentProductPackages [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+$base = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
+
+# Opcional: $search
+if ($Search -and $Search.Trim().Length -gt 0) {
+  $q = [System.Uri]::EscapeDataString($Search.Trim())
+  $base = "$base&`$search=$q"
+}
+
+# ✅ top conservador + paginación con nextLink
+$base = "$base&`$top=50"
+
+Write-Host "Export catálogo Content Hub (Solutions)"
+Write-Host "Workspace: $WorkspaceName"
+Write-Host "ApiVersion: $ApiVersion"
+Write-Host "IncludePreview: $IncludePreview"
+if ($Search -and $Search.Trim()) { Write-Host "Search: $Search" }
+Write-Host "OutCsv: $OutCsv"
+Write-Host ""
+
+$items = New-Object System.Collections.Generic.List[object]
+$next = $base
+$page = 0
+
+while ($next) {
+  $page++
+  Write-Host "Descargando página $page ..."
+  $resp = Invoke-ArmGet -Uri $next
+
+  if ($resp.value) {
+    foreach ($p in $resp.value) {
+
+      if (-not $p.properties -or $p.properties.contentKind -ne "Solution") { continue }
+
+      $isPreview = $false
+      if ($p.properties.PSObject.Properties.Name -contains "isPreview") {
+        try { $isPreview = [bool]$p.properties.isPreview } catch { $isPreview = $false }
+      }
+      if (-not $IncludePreview -and $isPreview) { continue }
+
+      $items.Add([pscustomobject]@{
+        displayName      = $p.properties.displayName
+        contentId        = $p.properties.contentId
+        contentProductId = $p.properties.contentProductId
+        version          = $p.properties.version
+        isPreview        = $isPreview
+        installedVersion = $p.properties.installedVersion
+      })
+    }
+  }
+
+  # nextLink para la siguiente página [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+  if ($resp.nextLink) { $next = $resp.nextLink } else { $next = $null }
+}
+
+Write-Host ""
+Write-Host "Total Solutions exportadas: $($items.Count)"
+
+($items | Sort-Object displayName) | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+Write-Host "CSV generado: $OutCsv"
