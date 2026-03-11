@@ -76,7 +76,6 @@ $ErrorActionPreference = "Stop"
 
 function Get-ArmToken {
   try {
-    # Token ARM con Azure CLI (robusto en OIDC GitHub Actions)
     $t = az account get-access-token `
       --resource https://management.azure.com/ `
       --query accessToken -o tsv
@@ -92,24 +91,18 @@ function Get-ArmToken {
 
 function Test-HasProperty {
   param(
-    [Parameter(Mandatory=$true)]
-    $Object,
-    [Parameter(Mandatory=$true)]
-    [string]$PropertyName
+    [Parameter(Mandatory=$true)] $Object,
+    [Parameter(Mandatory=$true)] [string]$PropertyName
   )
   return $null -ne $Object -and $Object.PSObject.Properties.Name -contains $PropertyName
 }
 
 function Get-PreviewFlag {
-  param(
-    [Parameter(Mandatory=$true)]
-    $Package
-  )
-  # Si no existe properties o no existe isPreview => asumimos False
+  param([Parameter(Mandatory=$true)] $Package)
+
   if (-not (Test-HasProperty -Object $Package -PropertyName "properties")) { return $false }
   if (-not (Test-HasProperty -Object $Package.properties -PropertyName "isPreview")) { return $false }
 
-  # Convertimos a boolean por si viene como string/null
   try { return [bool]$Package.properties.isPreview } catch { return $false }
 }
 
@@ -133,7 +126,6 @@ function Invoke-ArmWithRetry {
     $attempt++
     try {
       Write-Verbose "$Method $Uri (attempt $attempt/$MaxRetries)" -Verbose
-
       if ($null -ne $Body) {
         $json = $Body | ConvertTo-Json -Depth 50
         return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $json
@@ -178,7 +170,7 @@ if ($SolutionDisplayName.Count -gt 0) {
 
 $script:ArmToken = Get-ArmToken
 
-# 1) Listar paquetes instalados
+# Listar paquetes instalados
 $listUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages?api-version=$ApiVersion"
 Write-Verbose "GET $listUri" -Verbose
 $installed = Invoke-ArmWithRetry -Method GET -Uri $listUri
@@ -188,20 +180,19 @@ if (-not $installed.value) {
   return
 }
 
-# 2) Filtrar a soluciones (contentKind=Solution)
+# Filtrar a soluciones
 $solutions = $installed.value | Where-Object {
-  # algunos objetos pueden no tener properties bien formadas => validamos
   (Test-HasProperty -Object $_ -PropertyName "properties") -and
   (Test-HasProperty -Object $_.properties -PropertyName "contentKind") -and
   $_.properties.contentKind -eq "Solution"
 }
 
-# 3) Excluir preview si no se ha solicitado (robusto si isPreview no existe)
+# Excluir preview si no se ha solicitado (robusto)
 if (-not $IncludePreview) {
   $solutions = $solutions | Where-Object { -not (Get-PreviewFlag -Package $_) }
 }
 
-# 4) Filtrar por displayName si se proporciona
+# Filtrar por displayName si aplica
 if ($SolutionDisplayName.Count -gt 0) {
   $wanted = $SolutionDisplayName | ForEach-Object { $_.Trim() } | Where-Object { $_ }
   $solutions = $solutions | Where-Object {
@@ -238,7 +229,8 @@ foreach ($pkg in $solutions) {
   Write-Host "    contentId : $contentId"
   Write-Host "    version   : $version"
 
-  $pkgUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/$packageId?api-version=$ApiVersion"
+  # ✅ OJO: ${packageId} para que PowerShell NO intente leer $packageId?api como variable
+  $pkgUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentPackages/${packageId}?api-version=$ApiVersion"
 
   # Uninstall
   if ($PSCmdlet.ShouldProcess($displayName, "UNINSTALL $packageId")) {
