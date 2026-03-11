@@ -66,7 +66,7 @@ jobs:
         uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
-          pwsh: true
+          errorActionPreference: "Stop"
           inlineScript: |
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
@@ -80,7 +80,7 @@ jobs:
         uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
-          pwsh: true
+          errorActionPreference: "Stop"
           inlineScript: |
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
@@ -109,11 +109,19 @@ jobs:
           audience: api://AzureADTokenExchange
           enable-AzPSSession: true
 
+      # (Opcional pero útil para diagnóstico rápido)
+      - name: WhoAmI (debug)
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az account show
+            az account get-access-token --resource https://management.azure.com/ --query expiresOn -o tsv
+
       - name: Reinstall solutions (Content Hub)
         uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
-          pwsh: true
+          errorActionPreference: "Stop"
           inlineScript: |
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
