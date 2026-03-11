@@ -11,22 +11,33 @@ on:
         options:
           - deploy
           - list-catalog
+          - reinstall-solutions
+
+      # Solo para deploy/reinstall
       solutions:
-        description: "CSV de displayName a instalar (solo acción deploy)"
+        description: "CSV de displayName a instalar/reinstalar (vacío usa vars.SENTINEL_SOLUTIONS)"
         required: false
         default: ""
+
+      # Para list-catalog (y también se puede usar en reinstall si quieres)
       includePreview:
         description: "Incluir soluciones Preview (true/false)"
         required: false
         default: "false"
+
+      # Solo para list-catalog: filtra el catálogo
       catalogSearch:
-        description: "Filtro opcional para el catálogo (solo acción list-catalog). Vacío=todo"
+        description: "Filtro opcional catálogo (vacío = todo). Ej: NSG, Network Security"
         required: false
         default: ""
 
 permissions:
   id-token: write
   contents: read
+
+concurrency:
+  group: sentinel-lab-${{ github.ref }}-${{ github.event.inputs.action }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -89,7 +100,7 @@ jobs:
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
-            # Si quieres usar input "solutions" en vez de vars.SENTINEL_SOLUTIONS:
+            # Si el usuario mete input "solutions", lo usamos. Si no, usamos vars.SENTINEL_SOLUTIONS.
             $sol = "${{ github.event.inputs.solutions }}"
             if (-not $sol -or $sol.Trim().Length -eq 0) {
               $sol = "${{ vars.SENTINEL_SOLUTIONS }}"
@@ -102,55 +113,78 @@ jobs:
 
 
   list_catalog:
-  name: Export Content Hub Solutions Catalog (CSV)
-  runs-on: ubuntu-latest
-  if: ${{ github.event.inputs.action == 'list-catalog' }}
+    name: Export Content Hub Solutions Catalog (CSV)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'list-catalog' }}
 
-  steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Azure Login (OIDC)
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        audience: api://AzureADTokenExchange
-        enable-AzPSSession: true
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+          enable-AzPSSession: true
 
-    - name: Export catalog to CSV
-      uses: azure/powershell@v2
-      with:
-        azPSVersion: "latest"
-        errorActionPreference: "Stop"
-        inlineScript: |
-          $ErrorActionPreference = "Stop"
-          Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
+      - name: Export catalog to CSV
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          errorActionPreference: "Stop"
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
-          $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
-          $search = "${{ github.event.inputs.catalogSearch }}"
+            $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
+            $search = "${{ github.event.inputs.catalogSearch }}"
 
-          & "${{ github.workspace }}/scripts/00-export-contenthub-catalog.ps1" `
-            -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
-            -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
-            -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
-            -IncludePreview:($includePreview) `
-            -Search $search `
-            -OutCsv "${{ github.workspace }}/contenthub-solutions-catalog.csv"
+            & "${{ github.workspace }}/scripts/00-export-contenthub-catalog.ps1" `
+              -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
+              -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
+              -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
+              -IncludePreview:($includePreview) `
+              -Search $search `
+              -OutCsv "${{ github.workspace }}/contenthub-solutions-catalog.csv"
 
-    - name: Debug - list files
-      run: |
-        echo "PWD:"
-        pwd
-        echo "Workspace listing:"
-        ls -la "${{ github.workspace }}"
-        echo "CSV check:"
-        ls -la "${{ github.workspace }}/contenthub-solutions-catalog.csv" || true
+      - name: Debug - verify CSV exists
+        run: |
+          echo "Workspace:"
+          ls -la "${{ github.workspace }}"
+          echo "CSV:"
+          ls -la "${{ github.workspace }}/contenthub-solutions-catalog.csv"
 
-    - name: Upload CSV artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: contenthub-solutions-catalog
-        path: ${{ github.workspace }}/contenthub-solutions-catalog.csv
-        if-no-files-found: error
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contenthub-solutions-catalog
+          path: ${{ github.workspace }}/contenthub-solutions-catalog.csv
+          if-no-files-found: error
+
+
+  reinstall_solutions:
+    name: Reinstall Content Hub Solutions
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action == 'reinstall-solutions' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+          enable-AzPSSession: true
+
+      - name: Reinstall solutions
+        uses: azure/powershell@v2
+        with:
+          azPSVersion: "latest"
+          errorActionPreference: "Stop"
