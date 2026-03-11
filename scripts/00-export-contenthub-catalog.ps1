@@ -4,13 +4,13 @@ Exporta el catálogo completo de Microsoft Sentinel Content Hub (Solutions) a CS
 
 .DESCRIPTION
 - Llama a contentProductPackages (catálogo).
-- Gestiona paginación por nextLink.
+- Paginación por nextLink.
 - Filtra contentKind=Solution.
 - Exporta a CSV: displayName, contentId, contentProductId, version, isPreview, installedVersion.
 
-NOTA:
-- Usa token ARM via Azure CLI (az account get-access-token), ideal en GitHub Actions con OIDC.
-- Endpoint: contentProductPackages list (catálogo) soporta paging y nextLink. [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+Notas:
+- contentProductPackages soporta query options ($filter/$orderby/$top/$search/$skipToken) y paginación. [1](https://learn.microsoft.com/en-us/rest/api/securityinsights/product-packages/list?view=rest-securityinsights-2025-09-01)
+- $top debe ser entero >= 0 (OData), pero este servicio puede rechazar valores altos; usamos 50. [2](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-odata/505b6322-c57f-4c37-94ef-daf8b6e2abd3)
 #>
 
 [CmdletBinding()]
@@ -33,7 +33,7 @@ param(
   [Parameter(Mandatory = $false)]
   [switch]$IncludePreview,
 
-  # Opcional: si quieres filtrar por un término y exportar solo coincidencias
+  # Opcional: filtra por término de búsqueda (si vacío, trae todo)
   [Parameter(Mandatory = $false)]
   [string]$Search = ""
 )
@@ -56,73 +56,22 @@ function Invoke-ArmGet {
     Authorization  = "Bearer $script:ArmToken"
     "Content-Type" = "application/json"
   }
-  return Invoke-RestMethod -Method GET -Uri $Uri -Headers $headers
-}
 
-$script:ArmToken = Get-ArmToken
-
-# Endpoint base de catálogo (contentProductPackages). [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-$base = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
-
-# Opcional: aplicar $search (por query)
-if ($Search -and $Search.Trim().Length -gt 0) {
-  $q = [System.Uri]::EscapeDataString($Search.Trim())
-  $base = "$base&`$search=$q"
-}
-
-# Pedimos páginas razonables
-$base = "$base&`$top=200"
-
-Write-Host "Export catálogo Content Hub (Solutions)"
-Write-Host "Workspace: $WorkspaceName"
-Write-Host "ApiVersion: $ApiVersion"
-Write-Host "IncludePreview: $IncludePreview"
-if ($Search) { Write-Host "Search: $Search" }
-Write-Host "OutCsv: $OutCsv"
-Write-Host ""
-
-$items = New-Object System.Collections.Generic.List[object]
-$next = $base
-
-$page = 0
-while ($next) {
-  $page++
-  Write-Host "Descargando página $page ..."
-  $resp = Invoke-ArmGet -Uri $next
-
-  if ($resp.value) {
-    foreach ($p in $resp.value) {
-
-      # Filtrar a Solutions
-      if (-not $p.properties -or $p.properties.contentKind -ne "Solution") { continue }
-
-      # Excluir preview si aplica
-      $isPreview = $false
-      if ($p.properties.PSObject.Properties.Name -contains "isPreview") {
-        try { $isPreview = [bool]$p.properties.isPreview } catch { $isPreview = $false }
+  try {
+    return Invoke-RestMethod -Method GET -Uri $Uri -Headers $headers
+  } catch {
+    # Si ARM devuelve body con error, lo mostramos (ayuda a debug)
+    $body = $null
+    try {
+      if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        $body = $reader.ReadToEnd()
       }
-      if (-not $IncludePreview -and $isPreview) { continue }
-
-      $items.Add([pscustomobject]@{
-        displayName      = $p.properties.displayName
-        contentId        = $p.properties.contentId
-        contentProductId = $p.properties.contentProductId
-        version          = $p.properties.version
-        isPreview        = $isPreview
-        installedVersion = $p.properties.installedVersion
-      })
+    } catch {}
+    if ($body) {
+      throw "Fallo GET. Uri=$Uri. Body=$body"
     }
+    throw "Fallo GET. Uri=$Uri. Error=$($_.Exception.Message)"
   }
-
-  # Paginación: nextLink (cuando hay más resultados). [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-  if ($resp.nextLink) { $next = $resp.nextLink } else { $next = $null }
 }
 
-Write-Host ""
-Write-Host "Total Solutions exportadas: $($items.Count)"
-
-# Ordenar por displayName y exportar CSV
-$itemsSorted = $items | Sort-Object displayName
-$itemsSorted | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-
-Write-Host "CSV generado: $OutCsv"
