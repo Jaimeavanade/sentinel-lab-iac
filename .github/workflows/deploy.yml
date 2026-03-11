@@ -10,15 +10,19 @@ on:
         type: choice
         options:
           - deploy
-          - reinstall-solutions
+          - list-catalog
       solutions:
-        description: "CSV de displayName a reinstalar (vacío = todas). Ej: Microsoft Defender XDR, Azure Activity"
+        description: "CSV de displayName a instalar (solo acción deploy)"
         required: false
         default: ""
       includePreview:
         description: "Incluir soluciones Preview (true/false)"
         required: false
         default: "false"
+      catalogSearch:
+        description: "Filtro opcional para el catálogo (solo acción list-catalog). Vacío=todo"
+        required: false
+        default: ""
 
 permissions:
   id-token: write
@@ -85,16 +89,22 @@ jobs:
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
+            # Si quieres usar input "solutions" en vez de vars.SENTINEL_SOLUTIONS:
+            $sol = "${{ github.event.inputs.solutions }}"
+            if (-not $sol -or $sol.Trim().Length -eq 0) {
+              $sol = "${{ vars.SENTINEL_SOLUTIONS }}"
+            }
+
             & "${{ github.workspace }}/scripts/02-install-solutions.ps1" `
               -ResourceGroup "${{ vars.RESOURCE_GROUP }}" `
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
-              -SolutionsCsv "${{ vars.SENTINEL_SOLUTIONS }}"
+              -SolutionsCsv $sol
 
 
-  reinstall_contenthub_solutions:
-    name: Reinstall Content Hub Solutions
+  list_catalog:
+    name: Export Content Hub Solutions Catalog (CSV)
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action == 'reinstall-solutions' }}
+    if: ${{ github.event.inputs.action == 'list-catalog' }}
 
     steps:
       - name: Checkout
@@ -109,15 +119,7 @@ jobs:
           audience: api://AzureADTokenExchange
           enable-AzPSSession: true
 
-      # (Opcional pero útil para diagnóstico rápido)
-      - name: WhoAmI (debug)
-        uses: azure/cli@v2
-        with:
-          inlineScript: |
-            az account show
-            az account get-access-token --resource https://management.azure.com/ --query expiresOn -o tsv
-
-      - name: Reinstall solutions (Content Hub)
+      - name: Export catalog to CSV
         uses: azure/powershell@v2
         with:
           azPSVersion: "latest"
@@ -126,19 +128,19 @@ jobs:
             $ErrorActionPreference = "Stop"
             Set-AzContext -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | Out-Null
 
-            # Parse inputs
-            $solutionsCsv = "${{ github.event.inputs.solutions }}"
-            $solutionList = @()
-            if ($solutionsCsv -and $solutionsCsv.Trim().Length -gt 0) {
-              $solutionList = $solutionsCsv.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-            }
-
             $includePreview = ("${{ github.event.inputs.includePreview }}".ToLower() -eq "true")
+            $search = "${{ github.event.inputs.catalogSearch }}"
 
-            & "${{ github.workspace }}/scripts/03-reinstall-contenthub-solutions.ps1" `
+            & "${{ github.workspace }}/scripts/00-export-contenthub-catalog.ps1" `
               -SubscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" `
               -ResourceGroupName "${{ vars.RESOURCE_GROUP }}" `
               -WorkspaceName "${{ vars.WORKSPACE_NAME }}" `
-              -SolutionDisplayName $solutionList `
               -IncludePreview:($includePreview) `
-              -Verbose
+              -Search $search `
+              -OutCsv "contenthub-solutions-catalog.csv"
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contenthub-solutions-catalog
+          path: contenthub-solutions-catalog.csv
