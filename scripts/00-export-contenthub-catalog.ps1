@@ -9,8 +9,8 @@ Exporta el catálogo completo de Microsoft Sentinel Content Hub (Solutions) a CS
 - Exporta a CSV: displayName, contentId, contentProductId, version, isPreview, installedVersion.
 
 Notas:
-- contentProductPackages soporta query options y paginación por nextLink. [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
-- Usamos $top=50 para evitar errores de query OData en este endpoint; $top es un entero OData. [2](https://apitracker.io/a/azure-senitel)
+- contentProductPackages soporta query options y paginación por nextLink. [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+- installedVersion puede ser null o ausente si no está instalado. [1](https://github.com/pkhabazi/sentineldevops)
 #>
 
 [CmdletBinding()]
@@ -73,7 +73,7 @@ function Invoke-ArmGet {
 
 $script:ArmToken = Get-ArmToken
 
-# Catálogo: contentProductPackages [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+# Endpoint catálogo: contentProductPackages [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
 $base = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
 # Opcional: $search
@@ -82,7 +82,7 @@ if ($Search -and $Search.Trim().Length -gt 0) {
   $base = "$base&`$search=$q"
 }
 
-# ✅ top conservador + paginación con nextLink
+# $top conservador (si subes mucho, a veces el servicio devuelve error OData)
 $base = "$base&`$top=50"
 
 Write-Host "Export catálogo Content Hub (Solutions)"
@@ -105,13 +105,21 @@ while ($next) {
   if ($resp.value) {
     foreach ($p in $resp.value) {
 
+      # Solo Solutions
       if (-not $p.properties -or $p.properties.contentKind -ne "Solution") { continue }
 
+      # isPreview puede no existir en algunos casos
       $isPreview = $false
       if ($p.properties.PSObject.Properties.Name -contains "isPreview") {
         try { $isPreview = [bool]$p.properties.isPreview } catch { $isPreview = $false }
       }
       if (-not $IncludePreview -and $isPreview) { continue }
+
+      # ✅ installedVersion puede ser null o AUSENTE: lo tratamos seguro [1](https://github.com/pkhabazi/sentineldevops)
+      $installedVersion = $null
+      if ($p.properties.PSObject.Properties.Name -contains "installedVersion") {
+        $installedVersion = $p.properties.installedVersion
+      }
 
       $items.Add([pscustomobject]@{
         displayName      = $p.properties.displayName
@@ -119,12 +127,12 @@ while ($next) {
         contentProductId = $p.properties.contentProductId
         version          = $p.properties.version
         isPreview        = $isPreview
-        installedVersion = $p.properties.installedVersion
+        installedVersion = $installedVersion
       })
     }
   }
 
-  # nextLink para la siguiente página [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+  # Paginación por nextLink [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
   if ($resp.nextLink) { $next = $resp.nextLink } else { $next = $null }
 }
 
