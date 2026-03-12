@@ -5,12 +5,15 @@ Exporta el catálogo completo de Microsoft Sentinel Content Hub (Solutions) a CS
 .DESCRIPTION
 - Llama a contentProductPackages (catálogo).
 - Paginación por nextLink.
+- Arregla nextLink cuando viene sin api-version y/o con $SkipToken en lugar de $skipToken.
 - Filtra contentKind=Solution.
 - Exporta a CSV: displayName, contentId, contentProductId, version, isPreview, installedVersion.
 
 Notas:
-- contentProductPackages soporta query options y paginación por nextLink. [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
-- installedVersion puede ser null o ausente si no está instalado. [1](https://github.com/pkhabazi/sentineldevops)
+- contentProductPackages soporta query options y paginación por nextLink / $skipToken. [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+- api-version es obligatorio. [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+- $top debe ser entero >= 0 (OData). [2](https://apitracker.io/a/azure-senitel)
+- installedVersion puede ser null o ausente si no está instalado. [3](https://github.com/pkhabazi/sentineldevops)
 #>
 
 [CmdletBinding()]
@@ -71,9 +74,37 @@ function Invoke-ArmGet {
   }
 }
 
+function Normalize-NextLink {
+  <#
+    Arregla nextLink cuando:
+    - No incluye api-version (obligatorio). [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+    - Usa $SkipToken (casing raro) en lugar de $skipToken (documentado). [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+  #>
+  param(
+    [Parameter(Mandatory=$true)][string]$NextLink,
+    [Parameter(Mandatory=$true)][string]$ApiVersion
+  )
+
+  $fixed = $NextLink
+
+  # Normalizar casing del skiptoken si viene como $SkipToken
+  $fixed = $fixed -replace '\$SkipToken', '`$skipToken'
+
+  # Si no tiene api-version, añadirlo
+  if ($fixed -notmatch 'api-version=') {
+    if ($fixed -match '\?') {
+      $fixed = "$fixed&api-version=$ApiVersion"
+    } else {
+      $fixed = "$fixed?api-version=$ApiVersion"
+    }
+  }
+
+  return $fixed
+}
+
 $script:ArmToken = Get-ArmToken
 
-# Endpoint catálogo: contentProductPackages [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
+# Endpoint catálogo contentProductPackages [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
 $base = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion"
 
 # Opcional: $search
@@ -82,7 +113,7 @@ if ($Search -and $Search.Trim().Length -gt 0) {
   $base = "$base&`$search=$q"
 }
 
-# $top conservador (si subes mucho, a veces el servicio devuelve error OData)
+# $top conservador
 $base = "$base&`$top=50"
 
 Write-Host "Export catálogo Content Hub (Solutions)"
@@ -108,14 +139,14 @@ while ($next) {
       # Solo Solutions
       if (-not $p.properties -or $p.properties.contentKind -ne "Solution") { continue }
 
-      # isPreview puede no existir en algunos casos
+      # isPreview puede no existir
       $isPreview = $false
       if ($p.properties.PSObject.Properties.Name -contains "isPreview") {
         try { $isPreview = [bool]$p.properties.isPreview } catch { $isPreview = $false }
       }
       if (-not $IncludePreview -and $isPreview) { continue }
 
-      # ✅ installedVersion puede ser null o AUSENTE: lo tratamos seguro [1](https://github.com/pkhabazi/sentineldevops)
+      # installedVersion puede ser null o ausente [3](https://github.com/pkhabazi/sentineldevops)
       $installedVersion = $null
       if ($p.properties.PSObject.Properties.Name -contains "installedVersion") {
         $installedVersion = $p.properties.installedVersion
@@ -132,8 +163,12 @@ while ($next) {
     }
   }
 
-  # Paginación por nextLink [2](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)
-  if ($resp.nextLink) { $next = $resp.nextLink } else { $next = $null }
+  # nextLink → normalizar (api-version + skipToken)
+  if ($resp.nextLink) {
+    $next = Normalize-NextLink -NextLink $resp.nextLink -ApiVersion $ApiVersion
+  } else {
+    $next = $null
+  }
 }
 
 Write-Host ""
