@@ -1,17 +1,16 @@
 <#
 .SYNOPSIS
-Instala soluciones de Microsoft Sentinel Content Hub desde un CSV de displayName.
+Instala soluciones de Microsoft Sentinel Content Hub desde un CSV.
 
 .DESCRIPTION
-Para cada displayName:
-1) Busca en catálogo (contentProductPackages) usando $search y filtra contentKind=Solution.
-   Devuelve version/contentId/contentProductId/contentSchemaVersion y packagedContent (expand). [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-2) Instala el paquete en el workspace vía contentPackages/{packageId} (PUT) usando packageId=contentId. 
-3) Despliega packagedContent vía Microsoft.Resources/deployments mode=Incremental para materializar Installed content items. [3](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
+Entrada recomendada: contentId (más específico).
+- Si el elemento empieza por "azuresentinel." => se trata como contentId y se resuelve por $filter (exacto).
+- Si no => se trata como displayName (fallback) y se resuelve por $search + match.
 
-Requisitos:
-- azure/login (OIDC) ya ejecutado en el workflow.
-- Permisos adecuados (p.ej. Microsoft Sentinel Contributor). [4](https://github.com/noodlemctwoodle/Sentinel-As-Code)
+Usa:
+- Catálogo: contentProductPackages (soporta $filter/$search/$top y puede expandir packagedContent). [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)[2](https://github.com/pkhabazi/sentineldevops)
+- Install: contentPackages/{packageId} (PUT) requiere contentId/contentKind/contentProductId/displayName/version. [3](https://techcommunity.microsoft.com/blog/microsoftsentinelblog/deploying-and-managing-microsoft-sentinel-as-code/1131928)
+- Deploy: Microsoft.Resources/deployments mode=Incremental con template=packagedContent (materializa items). [4](https://www.youtube.com/watch?v=PAjnhYUFxPo)
 #>
 
 [CmdletBinding()]
@@ -47,19 +46,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ------------------------
-# Utilidades
-# ------------------------
 function Get-SubscriptionIdFromContext {
   try {
     $ctx = Get-AzContext
     if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id) { return $ctx.Subscription.Id }
   } catch {}
 
-  try {
-    $sub = az account show --query id -o tsv
-    if ($sub) { return $sub }
-  } catch {}
+  $sub = az account show --query id -o tsv
+  if ($sub) { return $sub }
 
   throw "No se pudo determinar SubscriptionId. Revisa azure/login / contexto."
 }
@@ -76,8 +70,7 @@ function Get-ErrorBodyFromException {
   param([Parameter(Mandatory=$true)] $Exception)
   try {
     if ($Exception.Response -and $Exception.Response.GetResponseStream) {
-      $stream = $Exception.Response.GetResponseStream()
-      $reader = New-Object System.IO.StreamReader($stream)
+      $reader = New-Object System.IO.StreamReader($Exception.Response.GetResponseStream())
       $body = $reader.ReadToEnd()
       if ($body) { return $body }
     }
@@ -119,7 +112,6 @@ function Invoke-ArmWithRetry {
         }
       } catch { }
 
-      # 400: no reintentar, devolver body
       if ($statusCode -eq 400) {
         $body = Get-ErrorBodyFromException -Exception $_.Exception
         if ($body) { throw "HTTP 400 en $Method $Uri. Body=$body" }
@@ -146,71 +138,65 @@ function Parse-SolutionsCsv {
   $raw.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 }
 
-# ------------------------
-# Catálogo (búsqueda y match estricto)
-# ------------------------
-function Get-CatalogCandidates {
+function Get-CatalogByContentId {
   <#
-    Catálogo: contentProductPackages, soporta $search y $expand=properties/packagedContent. [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
+    Resuelve EXACTO por contentId usando $filter (más fiable que displayName).
+    El endpoint soporta $filter y puede expandir packagedContent. [1](https://github.com/Azure/Azure-Sentinel/blob/master/Solutions/README.md)[2](https://github.com/pkhabazi/sentineldevops)
   #>
-  param([Parameter(Mandatory=$true)][string]$DisplayName)
+  param(
+    [Parameter(Mandatory=$true)][string]$ContentId
+  )
+
+  $filter = "properties/contentId eq '$ContentId' and properties/contentKind eq 'Solution'"
+  $encoded = [System.Uri]::EscapeDataString($filter)
+
+  $uri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion&`$filter=$encoded&`$expand=properties/packagedContent&`$top=50"
+
+  $resp = Invoke-ArmWithRetry -Method GET -Uri $uri
+  if (-not $resp.value -or $resp.value.Count -eq 0) {
+    throw "No se encontró en catálogo el contentId '$ContentId'. Revisa el CSV."
+  }
+
+  $candidates = $resp.value
+  if (-not $IncludePreview) {
+    $candidates = $candidates | Where-Object { -not $_.properties.isPreview }
+  }
+
+  # Elegir versión más alta por si hay varias
+  $sorted = $candidates | Sort-Object -Property @{
+    Expression = { try { [version]$_.properties.version } catch { [version]"0.0.0" } }
+  } -Descending
+
+  return ($sorted | Select-Object -First 1)
+}
+
+function Get-CatalogByDisplayName {
+  <#
+    Fallback: busca por displayName con $search.
+    (Lo dejamos por compatibilidad.)
+  #>
+  param(
+    [Parameter(Mandatory=$true)][string]$DisplayName
+  )
 
   $search = [System.Uri]::EscapeDataString($DisplayName)
   $uri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/providers/Microsoft.SecurityInsights/contentProductPackages?api-version=$ApiVersion&`$search=$search&`$expand=properties/packagedContent&`$top=50"
 
   $resp = Invoke-ArmWithRetry -Method GET -Uri $uri
-  if (-not $resp.value) { return @() }
+  if (-not $resp.value) { throw "Catálogo sin resultados para '$DisplayName'." }
 
   $candidates = $resp.value | Where-Object { $_.properties.contentKind -eq "Solution" }
+  if (-not $IncludePreview) { $candidates = $candidates | Where-Object { -not $_.properties.isPreview } }
 
-  if (-not $IncludePreview) {
-    $candidates = $candidates | Where-Object { -not $_.properties.isPreview }
+  $req = $DisplayName.Trim().ToLower()
+  $exact = $candidates | Where-Object { $_.properties.displayName -and $_.properties.displayName.Trim().ToLower() -eq $req }
+  $pool = if ($exact) { $exact } else { $candidates | Where-Object { $_.properties.displayName -and $_.properties.displayName.Trim().ToLower().Contains($req) } }
+
+  if (-not $pool) {
+    $names = ($candidates | Select-Object -ExpandProperty properties | Select-Object -ExpandProperty displayName | Sort-Object -Unique) -join " | "
+    throw "No hay match para '$DisplayName'. Candidatos: $names"
   }
 
-  return $candidates
-}
-
-function Select-BestCatalogMatch {
-  <#
-    Match estricto:
-    1) Exacto por displayName (case-insensitive)
-    2) Si no, match por "contains" (case-insensitive)
-    3) Si sigue sin haber nada, FALLA (no elige random).
-  #>
-  param(
-    [Parameter(Mandatory=$true)][string]$RequestedDisplayName,
-    [Parameter(Mandatory=$true)]$Candidates
-  )
-
-  if (-not $Candidates -or $Candidates.Count -eq 0) {
-    throw "Catálogo sin candidatos Solution para '$RequestedDisplayName'."
-  }
-
-  $req = $RequestedDisplayName.Trim().ToLower()
-
-  $exact = $Candidates | Where-Object {
-    $_.properties.displayName -and $_.properties.displayName.Trim().ToLower() -eq $req
-  }
-
-  $pool = $null
-  if ($exact -and $exact.Count -gt 0) {
-    $pool = $exact
-  } else {
-    $contains = $Candidates | Where-Object {
-      $_.properties.displayName -and $_.properties.displayName.Trim().ToLower().Contains($req)
-    }
-    if ($contains -and $contains.Count -gt 0) {
-      $pool = $contains
-    }
-  }
-
-  if (-not $pool -or $pool.Count -eq 0) {
-    $names = ($Candidates | Select-Object -ExpandProperty properties |
-      Select-Object -ExpandProperty displayName | Sort-Object -Unique) -join " | "
-    throw "No hay match para '$RequestedDisplayName'. Candidatos devueltos por catálogo: $names"
-  }
-
-  # Elegir la mayor versión (semver)
   $sorted = $pool | Sort-Object -Property @{
     Expression = { try { [version]$_.properties.version } catch { [version]"0.0.0" } }
   } -Descending
@@ -218,13 +204,9 @@ function Select-BestCatalogMatch {
   return ($sorted | Select-Object -First 1)
 }
 
-# ------------------------
-# Instalación (contentPackages)
-# ------------------------
 function Install-ContentPackageFromCatalogItem {
   <#
-    Install endpoint: contentPackages/{packageId} (PUT). 
-    IMPORTANTE: packageId = contentId (no contentProductId)
+    Instala mediante contentPackages/{packageId}. packageId lo ponemos como contentId (correcto). [3](https://techcommunity.microsoft.com/blog/microsoftsentinelblog/deploying-and-managing-microsoft-sentinel-as-code/1131928)
   #>
   param([Parameter(Mandatory=$true)]$CatalogItem)
 
@@ -233,10 +215,11 @@ function Install-ContentPackageFromCatalogItem {
   $contentProductId = $CatalogItem.properties.contentProductId
   $displayName      = $CatalogItem.properties.displayName
   $version          = $CatalogItem.properties.version
-  $schemaVersion    = $CatalogItem.properties.contentSchemaVersion
+
+  # contentSchemaVersion: lo enviamos para evitar errores conocidos de 400 en installs
+  $schemaVersion = $CatalogItem.properties.contentSchemaVersion
   if (-not $schemaVersion) { $schemaVersion = "2.0" }
 
-  # ✅ CLAVE: packageId en la URL debe ser el ID del paquete (usamos contentId)
   $packageId = $contentId
 
   Write-Host "==> Instalando/actualizando: $displayName"
@@ -263,27 +246,20 @@ function Install-ContentPackageFromCatalogItem {
   Write-Host "    OK: contentPackage instalado/actualizado"
 }
 
-# ------------------------
-# Deployment (packagedContent)
-# ------------------------
 function Deploy-PackagedContentFromCatalogItem {
   <#
-    contentProductPackages puede expandir packagedContent para desplegar el ARM template. [1](https://charbelnemnom.com/update-microsoft-sentinel-workbooks-at-scale/)[2](https://learn.microsoft.com/en-us/rest/api/securityinsights/content-packages?view=rest-securityinsights-2025-09-01)
-    Este deployment incremental materializa Installed content items. [3](https://techcommunity.microsoft.com/discussions/sharepointdev/the-remote-server-returned-an-error-400-bad-request/2332780)
+    Despliega packagedContent (ARM template) en modo Incremental para materializar items. [4](https://www.youtube.com/watch?v=PAjnhYUFxPo)
   #>
   param([Parameter(Mandatory=$true)]$CatalogItem)
 
   $displayName = $CatalogItem.properties.displayName
   $template = $CatalogItem.properties.packagedContent
-  if (-not $template) {
-    throw "No hay packagedContent en catálogo para '$displayName'."
-  }
+  if (-not $template) { throw "No hay packagedContent en catálogo para '$displayName'." }
 
   $safeName = ($displayName -replace '[^a-zA-Z0-9\-]', '-')
   $deploymentName = "ContentHub-Install-$safeName"
   if ($deploymentName.Length -gt 62) { $deploymentName = $deploymentName.Substring(0, 62) }
 
-  # ✅ FIX ${deploymentName}?api-version
   $deployUri = "https://management.azure.com/subscriptions/$script:SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Resources/deployments/${deploymentName}?api-version=$DeploymentApiVersion"
 
   $deployBody = @{
@@ -314,7 +290,6 @@ function Deploy-PackagedContentFromCatalogItem {
       $details = $get.properties.error | ConvertTo-Json -Depth 30
       throw "Deployment $deploymentName terminó en estado $state. Error: $details"
     }
-
     Start-Sleep -Seconds 10
   }
 
@@ -339,17 +314,18 @@ foreach ($sol in $solutions) {
   Write-Host "Procesando: $sol"
   Write-Host "============================="
 
-  # 1) catálogo
-  $candidates = Get-CatalogCandidates -DisplayName $sol
-  $match = Select-BestCatalogMatch -RequestedDisplayName $sol -Candidates $candidates
+  # Si parece contentId, resolver por filter (exacto)
+  $catalogItem = $null
+  if ($sol.Trim().ToLower().StartsWith("azuresentinel.")) {
+    $catalogItem = Get-CatalogByContentId -ContentId $sol.Trim()
+  } else {
+    $catalogItem = Get-CatalogByDisplayName -DisplayName $sol.Trim()
+  }
 
-  Write-Host "Catálogo match: $($match.properties.displayName) (version: $($match.properties.version))"
+  Write-Host "Catálogo match: $($catalogItem.properties.displayName) (version: $($catalogItem.properties.version))"
 
-  # 2) install package (contentPackages)
-  Install-ContentPackageFromCatalogItem -CatalogItem $match
-
-  # 3) deploy packagedContent (Installed content items)
-  Deploy-PackagedContentFromCatalogItem -CatalogItem $match
+  Install-ContentPackageFromCatalogItem -CatalogItem $catalogItem
+  Deploy-PackagedContentFromCatalogItem -CatalogItem $catalogItem
 }
 
 Write-Host ""
