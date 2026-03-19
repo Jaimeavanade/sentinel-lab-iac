@@ -58,7 +58,13 @@ jobs:
           audience: api://AzureADTokenExchange
           enable-AzPSSession: true
 
-      
+      - name: Create Resource Group
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az group create \
+              --name "${{ vars.RESOURCE_GROUP }}" \
+              --location "${{ vars.LOCATION }}"
 
       - name: Deploy Log Analytics Workspace (Bicep)
         uses: azure/cli@v2
